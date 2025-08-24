@@ -1,4 +1,316 @@
-const TTL_MS=20601000;export default{async fetch(req,env){const u=new URL(req.url);if(u.pathname==="/ws"){const raw=u.searchParams.get("uid")||"anon",uid=String(raw).slice(0,64).replace(/[^a-zA-Z0-9_-]/g,"")||"anon",id=env.MY_DURABLE_OBJECT.idFromName(uid);return env.MY_DURABLE_OBJECT.get(id).fetch(req)}return new Response("not found",{status:404})}};
+const TTL_MS = 20601000;
 
-export class MyDurableObject{constructor(state,env){this.state=state;this.env=env;this.sockets=new Set;this.reset()}reset(){this.rid=null;this.buffer=[];this.seq=-1;this.phase="idle";this.error=null;this.controller=null} async fetch(req){if(req.headers.get("Upgrade")!=="websocket")return new Response("Expected websocket",{status:426});const pair=new WebSocketPair, [client,server]=Object.values(pair);server.accept();this.sockets.add(server);server.addEventListener("close",()=>this.sockets.delete(server));server.addEventListener("message",e=>this.onMessage(server,e));return new Response(null,{status:101,webSocket:client})} send(ws,o){try{ws.send(JSON.stringify(o))}catch{}}bcast(o){const s=JSON.stringify(o);for(const ws of this.sockets)try{ws.send(s)}catch{}} async restoreIfCold(){if(this.rid)return;const snap=await this.state.storage.get("run").catch(()=>null),fresh=snap&&Date.now()-(snap.savedAt||0)<TTL_MS;if(!fresh){if(snap)await this.state.storage.delete("run").catch(()=>{});return}this.rid=snap.rid||null;this.buffer=Array.isArray(snap.buffer)?snap.buffer:[];this.seq=Number.isFinite(+snap.seq)?+snap.seq:-1;this.phase=snap.phase||"done";this.error=snap.error||null} saveSnapshot(){const data={rid:this.rid,buffer:this.buffer,seq:this.seq,phase:this.phase,error:this.error,savedAt:Date.now()};this.state.storage.put("run",data).catch(()=>{})} replay(ws,after){for(const it of this.buffer)if(it.seq>after)this.send(ws,{type:"delta",seq:it.seq,text:it.text});if(this.phase==="done")this.send(ws,{type:"done"});if(this.phase==="error")this.send(ws,{type:"err",message:this.error})} async onMessage(ws,evt){await this.restoreIfCold();let m;try{m=JSON.parse(String(evt.data||""))}catch{return this.send(ws,{type:"err",message:"bad_json"})}if(m.type==="resume"){if(!m.rid||m.rid!==this.rid)return this.send(ws,{type:"err",message:"stale_run"});const a=Number.isFinite(+m.after)?+m.after:-1;return this.replay(ws,a)}if(m.type==="stop"){if(m.rid&&m.rid===this.rid)this.stop("client");return}if(m.type!=="begin")return this.send(ws,{type:"err",message:"bad_type"});const{rid,apiKey,or_body,model,messages,after}=m,body=or_body||(model&&Array.isArray(messages)?{model,messages,stream:true}:null);if(!rid||!apiKey||!body||!Array.isArray(body.messages)||!body.messages.length)return this.send(ws,{type:"err",message:"missing_fields"});if(this.phase==="running"&&rid!==this.rid)return this.send(ws,{type:"err",message:"busy"});if(rid===this.rid&&this.phase!=="idle"){const a=Number.isFinite(+after)?+after:-1;return this.replay(ws,a)}this.reset();this.rid=rid;this.phase="running";this.controller=new AbortController;this.saveSnapshot();this.stream({apiKey,body}).catch(e=>this.fail(String(e?.message||"stream_failed")))} async stream({apiKey,body}){const res=await fetch("https://openrouter.ai/api/v1/chat/completions",{method:"POST",headers:{"Content-Type":"application/json",Authorization:"Bearer "+apiKey},body:JSON.stringify(body),signal:this.controller.signal}).catch(e=>({ok:false,status:0,body:null,text:async()=>String(e?.message||"fetch_failed")}));if(!res.ok||!res.body){const t=await res.text().catch(()=>"");return this.fail(t||"HTTP "+res.status)}const dec=new TextDecoder,reader=res.body.getReader();let buf="",done=false;const cut=s=>{const a=s.indexOf("\n\n"),b=s.indexOf("\r\n\r\n");return a<0?b:b<0?a:Math.min(a,b)};const take=()=>{const i=cut(buf);if(i<0)return null;const ch=buf.slice(0,i);buf=buf.slice(i+(buf[i]==='\r'?4:2));return ch};const push=d=>{const seq=++this.seq;this.buffer.push({seq,text:d});this.bcast({type:"delta",seq,text:d});this.saveSnapshot()};while(this.phase==="running"){const r=await reader.read().catch(()=>({done:true}));if(r.done)break;buf+=dec.decode(r.value,{stream:true});for(let ch;(ch=take());){const t=ch.replace(/\r\n/g,"\n").trim();if(!t||!t.startsWith("data:"))continue;let stop=false;for(const line of t.split("\n")){if(!line.startsWith("data:"))continue;const data=line.slice(5).trim();if(data==="[DONE]"){done=true;stop=true;break}try{const j=JSON.parse(data),d=j?.choices?.[0]?.delta?.content??"";if(d)push(d);if(j?.choices?.[0]?.finish_reason){done=true;stop=true;break}}catch{}}if(stop)break}if(done)break}const tail=(buf+dec.decode()).replace(/\r\n/g,"\n");if(!done&&tail){for(const seg of tail.split("\n\n")){const t=seg.trim();if(!t||!t.startsWith("data:"))continue;const data=t.slice(5).trim();if(data==="[DONE]"){done=true;break}try{const j=JSON.parse(data),d=j?.choices?.[0]?.delta?.content??"";if(d)push(d);if(j?.choices?.[0]?.finish_reason){done=true;break}}catch{}}}this.finish()} finish(){if(this.phase!=="running")return;this.phase="done";try{this.controller?.abort()}catch{}this.saveSnapshot();this.bcast({type:"done"})} stop(){if(this.phase!=="running")return;this.phase="done";try{this.controller?.abort()}catch{}this.saveSnapshot();this.bcast({type:"done"})} fail(message){if(this.phase==="error")return;this.phase="error";this.error=message;try{this.controller?.abort()}catch{}this.saveSnapshot();this.bcast({type:"err",message})}}
+export default {
+  async fetch(req, env) {
+    const u = new URL(req.url);
+    if (u.pathname === "/ws") {
+      const raw = u.searchParams.get("uid") || "anon";
+      const uid = String(raw).slice(0, 64).replace(/[^a-zA-Z0-9_-]/g, "") || "anon";
+      const id = env.MY_DURABLE_OBJECT.idFromName(uid);
+      return env.MY_DURABLE_OBJECT.get(id).fetch(req);
+    }
+    return new Response("not found", { status: 404, headers: { "content-type": "text/plain" } });
+  }
+};
 
+export class MyDurableObject {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.sockets = new Set();
+    this.reset();
+  }
+
+  reset() {
+    this.rid = null;
+    this.buffer = [];
+    this.seq = -1;
+    this.phase = "idle";
+    this.error = null;
+    this.controller = null;
+  }
+
+  async fetch(req) {
+    if (req.method !== "GET" || req.headers.get("Upgrade") !== "websocket") {
+      return new Response("Expected websocket", { status: 426, headers: { "content-type": "text/plain" } });
+    }
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+
+    server.accept();
+    this.sockets.add(server);
+
+    const onCloseOrError = () => {
+      this.sockets.delete(server);
+      server.removeEventListener("close", onCloseOrError);
+      server.removeEventListener("error", onCloseOrError);
+    };
+
+    server.addEventListener("close", onCloseOrError);
+    server.addEventListener("error", onCloseOrError);
+
+    server.addEventListener("message", (e) => {
+      Promise.resolve(this.onMessage(server, e)).catch(() => {
+        // Don't throw from event handler; send a soft error back if possible
+        this.send(server, { type: "err", message: "internal_error" });
+      });
+    });
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  send(ws, o) {
+    try {
+      ws.send(JSON.stringify(o));
+    } catch {
+      // no-op
+    }
+  }
+
+  bcast(o) {
+    const s = JSON.stringify(o);
+    for (const ws of this.sockets) {
+      try {
+        ws.send(s);
+      } catch {
+        // no-op
+      }
+    }
+  }
+
+  async restoreIfCold() {
+    if (this.rid) return;
+
+    const snap = await this.state.storage.get("run").catch(() => null);
+    const fresh = snap && Date.now() - (snap.savedAt || 0) < TTL_MS;
+
+    if (!fresh) {
+      if (snap) await this.state.storage.delete("run").catch(() => {});
+      return;
+    }
+
+    this.rid = snap.rid || null;
+    this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
+    this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
+    this.phase = snap.phase || "done";
+    this.error = snap.error || null;
+  }
+
+  saveSnapshot() {
+    const data = {
+      rid: this.rid,
+      buffer: this.buffer,
+      seq: this.seq,
+      phase: this.phase,
+      error: this.error,
+      savedAt: Date.now()
+    };
+    this.state.storage.put("run", data).catch(() => {});
+  }
+
+  replay(ws, after) {
+    for (const it of this.buffer) {
+      if (it.seq > after) this.send(ws, { type: "delta", seq: it.seq, text: it.text });
+    }
+    if (this.phase === "done") this.send(ws, { type: "done" });
+    if (this.phase === "error") this.send(ws, { type: "err", message: this.error });
+  }
+
+  async onMessage(ws, evt) {
+    await this.restoreIfCold();
+
+    let m;
+    try {
+      m = JSON.parse(String(evt.data || ""));
+    } catch {
+      return this.send(ws, { type: "err", message: "bad_json" });
+    }
+
+    if (m.type === "resume") {
+      if (!m.rid || m.rid !== this.rid) return this.send(ws, { type: "err", message: "stale_run" });
+      const a = Number.isFinite(+m.after) ? +m.after : -1;
+      return this.replay(ws, a);
+    }
+
+    if (m.type === "stop") {
+      if (m.rid && m.rid === this.rid) this.stop("client");
+      return;
+    }
+
+    if (m.type !== "begin") return this.send(ws, { type: "err", message: "bad_type" });
+
+    const { rid, apiKey, or_body, model, messages, after } = m;
+    const body = or_body || (model && Array.isArray(messages) ? { model, messages, stream: true } : null);
+
+    if (!rid || !apiKey || !body || !Array.isArray(body.messages) || !body.messages.length) {
+      return this.send(ws, { type: "err", message: "missing_fields" });
+    }
+
+    if (this.phase === "running" && rid !== this.rid) {
+      return this.send(ws, { type: "err", message: "busy" });
+    }
+
+    if (rid === this.rid && this.phase !== "idle") {
+      const a = Number.isFinite(+after) ? +after : -1;
+      return this.replay(ws, a);
+    }
+
+    this.reset();
+    this.rid = rid;
+    this.phase = "running";
+    this.controller = new AbortController();
+    this.saveSnapshot();
+
+    this.stream({ apiKey, body }).catch((e) => this.fail(String(e?.message || "stream_failed")));
+  }
+
+  async stream({ apiKey, body }) {
+    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + apiKey
+      },
+      body: JSON.stringify(body),
+      signal: this.controller.signal
+    }).catch((e) => ({
+      ok: false,
+      status: 0,
+      body: null,
+      text: async () => String(e?.message || "fetch_failed")
+    }));
+
+    if (!res.ok || !res.body) {
+      const t = await res.text().catch(() => "");
+      return this.fail(t || "HTTP " + res.status);
+    }
+
+    const dec = new TextDecoder();
+    const reader = res.body.getReader();
+    let buf = "";
+    let done = false;
+
+    const cut = (s) => {
+      const a = s.indexOf("\n\n");
+      const b = s.indexOf("\r\n\r\n");
+      return a < 0 ? b : b < 0 ? a : Math.min(a, b);
+    };
+
+    const take = () => {
+      const i = cut(buf);
+      if (i < 0) return null;
+      const ch = buf.slice(0, i);
+      const delimLen = buf[i] === "\r" ? 4 : 2;
+      buf = buf.slice(i + delimLen);
+      return ch;
+    };
+
+    const push = (d) => {
+      const seq = ++this.seq;
+      this.buffer.push({ seq, text: d });
+      this.bcast({ type: "delta", seq, text: d });
+      this.saveSnapshot();
+    };
+
+    while (this.phase === "running") {
+      const r = await reader.read().catch(() => ({ done: true }));
+      if (r.done) break;
+      buf += dec.decode(r.value, { stream: true });
+
+      for (let ch; (ch = take()); ) {
+        const t = ch.replace(/\r\n/g, "\n").trim();
+        if (!t || !t.startsWith("data:")) continue;
+
+        let stop = false;
+        for (const line of t.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+
+          if (data === "[DONE]") {
+            done = true;
+            stop = true;
+            break;
+          }
+
+          try {
+            const j = JSON.parse(data);
+            const d = j?.choices?.[0]?.delta?.content ?? "";
+            if (d) push(d);
+            if (j?.choices?.[0]?.finish_reason) {
+              done = true;
+              stop = true;
+              break;
+            }
+          } catch {
+            // ignore parse errors for partial/keep-alive chunks
+          }
+        }
+
+        if (stop) break;
+      }
+
+      if (done) break;
+    }
+
+    const tail = (buf + dec.decode()).replace(/\r\n/g, "\n");
+    if (!done && tail) {
+      for (const seg of tail.split("\n\n")) {
+        const t = seg.trim();
+        if (!t || !t.startsWith("data:")) continue;
+
+        const data = t.slice(5).trim();
+        if (data === "[DONE]") {
+          done = true;
+          break;
+        }
+
+        try {
+          const j = JSON.parse(data);
+          const d = j?.choices?.[0]?.delta?.content ?? "";
+          if (d) push(d);
+          if (j?.choices?.[0]?.finish_reason) {
+            done = true;
+            break;
+          }
+        } catch {
+          // ignore parse errors
+        }
+      }
+    }
+
+    this.finish();
+  }
+
+  finish() {
+    if (this.phase !== "running") return;
+    this.phase = "done";
+    try {
+      this.controller?.abort();
+    } catch {}
+    this.saveSnapshot();
+    this.bcast({ type: "done" });
+  }
+
+  stop() {
+    if (this.phase !== "running") return;
+    this.phase = "done";
+    try {
+      this.controller?.abort();
+    } catch {}
+    this.saveSnapshot();
+    this.bcast({ type: "done" });
+  }
+
+  fail(message) {
+    if (this.phase === "error") return;
+    this.phase = "error";
+    this.error = message;
+    try {
+      this.controller?.abort();
+    } catch {}
+    this.saveSnapshot();
+    this.bcast({ type: "err", message });
+  }
+}
