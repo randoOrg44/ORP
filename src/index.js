@@ -1,4 +1,4 @@
-const TTL_MS = 10 * 60 * 1000; // allow 10 min resumes
+const TTL_MS = 20 * 60 * 1000; // allow 10 min resumes
 
 export default {
   async fetch(req, env) {
