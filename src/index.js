@@ -1,55 +1,37 @@
-// src/index.js
-// Assumes wrangler.toml has a binding:
-// [durable_objects]
-// bindings = [{ name = "MY_DURABLE_OBJECT", class_name = "MyDurableObject" }]
-
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
 
-    // WebSocket entrypoint; path includes a "room" or "thread" id you choose.
-    // e.g. wss://<your-domain>/ws/foo
-    if (url.pathname.startsWith("/ws/")) {
-      const name = url.pathname.split("/").pop() || "default";
-      const id = env.MY_DURABLE_OBJECT.idFromName(name);
+    if (url.pathname === "/ws") {
+      const id = env.MY_DURABLE_OBJECT.idFromName("singleton");
       const stub = env.MY_DURABLE_OBJECT.get(id);
       return stub.fetch(req);
     }
-
-    // (Optional) health
-    if (url.pathname === "/health") return new Response("ok");
 
     return new Response("not found", { status: 404 });
   }
 }
 
 /**
- * Durable Object that:
- * - Accepts WebSocket connections
- * - Starts an OpenRouter streaming run exactly once per runId ("begin")
- * - Buffers every delta with an incremental seq
- * - Replays backlog on "resume"
- *
- * Messages over WS (JSON):
- *  Client -> DO:
- *    {type:"begin", runId, after?:number, model, messages, apiKey}
- *    {type:"resume", runId, after:number}
- *  DO -> Client:
- *    {type:"delta", runId, seq:number, text:string}
- *    {type:"done",  runId}
- *    {type:"err",   runId, message}
+ * Single-run Durable Object:
+ * - buffers deltas with seq++
+ * - begin(apiKey, model, messages)
+ * - resume(after)
  */
 export class MyDurableObject {
   constructor(state, env) {
     this.state = state;
     this.env = env;
 
-    /** Map<runId, Run> */
-    this.runs = new Map();
+    this.buffer = [];       // [{seq, text}]
+    this.seq = -1;
+    this.started = false;
+    this.finished = false;
+    this.error = null;
+    this.sockets = new Set();
   }
 
   async fetch(req) {
-    // Only WS here.
     if (req.headers.get("Upgrade") !== "websocket")
       return new Response("Expected websocket", { status: 426 });
 
@@ -57,186 +39,102 @@ export class MyDurableObject {
     const [client, server] = Object.values(pair);
     server.accept();
 
-    // Light ping/pong to keep connections healthy (helps some proxies)
-    const ping = setInterval(() => {
-      try { server.send(JSON.stringify({ type: "ping" })); } catch {}
-    }, 30000);
-
+    this.sockets.add(server);
+    server.addEventListener("close", () => this.sockets.delete(server));
     server.addEventListener("message", (evt) => this.#onMessage(server, evt));
-    server.addEventListener("close", () => clearInterval(ping));
-    server.addEventListener("error", () => clearInterval(ping));
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  #send(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch {} }
+  #broadcast(obj) { const s = JSON.stringify(obj); for (const ws of this.sockets) { try { ws.send(s); } catch {} } }
+
+  #replay(ws, after) {
+    for (const it of this.buffer) if (it.seq > after) this.#send(ws, { type: "delta", seq: it.seq, text: it.text });
+    if (this.finished) this.#send(ws, { type: "done" });
+    if (this.error) this.#send(ws, { type: "err", message: this.error });
+  }
+
   async #onMessage(ws, evt) {
-    let msg;
-    try { msg = JSON.parse(String(evt.data || "")); }
-    catch { return ws.send(JSON.stringify({ type: "err", message: "bad json" })); }
-
-    const t = msg?.type;
-    if (t !== "begin" && t !== "resume") {
-      return ws.send(JSON.stringify({ type: "err", message: "bad type" }));
+    let msg; try { msg = JSON.parse(String(evt.data || "")); } catch { return this.#send(ws, { type: "err", message: "bad json" }); }
+    if (msg?.type === "resume") {
+      const after = Number.isFinite(+msg.after) ? +msg.after : -1;
+      return this.#replay(ws, after);
     }
+    if (msg?.type !== "begin") return this.#send(ws, { type: "err", message: "bad type" });
 
-    const runId = String(msg.runId || "");
-    if (!runId) return ws.send(JSON.stringify({ type: "err", message: "missing runId" }));
+    const { apiKey, model, messages, after } = msg;
+    if (!apiKey || !model || !Array.isArray(messages) || !messages.length)
+      return this.#send(ws, { type: "err", message: "missing fields" });
 
-    // Get or create the run record
-    let run = this.runs.get(runId);
-    if (!run) {
-      run = {
-        buffer: [],          // [{seq, text}]
-        seq: 0,
-        sockets: new Set(),  // live clients
-        started: false,
-        finished: false,
-        error: null,
-        // (Optional) persist some metadata in storage if you want cross-restart resume
-      };
-      this.runs.set(runId, run);
-    }
+    // If already running, just replay and tail.
+    this.#replay(ws, Number.isFinite(+after) ? +after : -1);
+    if (this.started) return;
 
-    // Track this ws in the run
-    run.sockets.add(ws);
-    ws.addEventListener("close", () => run.sockets.delete(ws));
+    // Reset state for a fresh run.
+    this.buffer = [];
+    this.seq = -1;
+    this.finished = false;
+    this.error = null;
+    this.started = true;
 
-    const after = Number.isFinite(+msg.after) ? +msg.after : -1;
-
-    if (t === "begin") {
-      if (run.started) {
-        // Already running. Just replay backlog from 'after' and follow the stream.
-        this.#replay(run, ws, after);
-        if (run.finished) ws.send(JSON.stringify({ type: "done", runId }));
-        return;
-      }
-
-      // Start upstream stream once
-      run.started = true;
-      const { model, messages, apiKey } = msg;
-
-      // Simple guards
-      if (!apiKey) return this.#failRun(runId, run, "Missing apiKey");
-      if (!model) return this.#failRun(runId, run, "Missing model");
-      if (!Array.isArray(messages) || !messages.length) {
-        return this.#failRun(runId, run, "Missing messages");
-      }
-
-      // Kick off upstream streaming (no await; fire-and-forget with catch)
-      this.#replay(run, ws, after);
-      this.#streamFromOpenRouter(runId, run, { apiKey, model, messages })
-        .catch(err => this.#failRun(runId, run, err?.message || "stream failed"));
-    } else if (t === "resume") {
-      // Just replay from 'after'. If still streaming, the client will keep receiving.
-      this.#replay(run, ws, after);
-      if (run.finished) ws.send(JSON.stringify({ type: "done", runId }));
-      if (run.error) ws.send(JSON.stringify({ type: "err", runId, message: run.error }));
-    }
+    // Stream from OpenRouter
+    this.#streamOpenRouter({ apiKey, model, messages }).catch((e) => this.#fail(String(e?.message || "stream failed")));
   }
 
-  #replay(run, ws, after) {
-    // Send buffered deltas with seq > after
-    for (const item of run.buffer) {
-      if (item.seq > after) {
-        try { ws.send(JSON.stringify({ type: "delta", runId: item.runId, seq: item.seq, text: item.text })); }
-        catch {}
-      }
-    }
-  }
-
-  async #streamFromOpenRouter(runId, run, { apiKey, model, messages }) {
-    const body = JSON.stringify({
-      model,
-      messages,
-      stream: true
-    });
-
+  async #streamOpenRouter({ apiKey, model, messages }) {
     const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + apiKey
-      },
-      body
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + apiKey },
+      body: JSON.stringify({ model, messages, stream: true })
     });
-
     if (!res.ok || !res.body) {
-      const errText = await res.text().catch(() => "");
-      this.#failRun(runId, run, errText || `HTTP ${res.status}`);
-      return;
+      const t = await res.text().catch(() => "");
+      return this.#fail(t || `HTTP ${res.status}`);
     }
 
     const dec = new TextDecoder();
     const reader = res.body.getReader();
-    let buffer = "";
+    let buf = "";
 
-    // Parse SSE: "\n\n" delimited lines, "data: {...}"
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      buffer += dec.decode(value, { stream: true });
+      buf += dec.decode(value, { stream: true });
 
-      let idx;
-      while ((idx = buffer.indexOf("\n\n")) !== -1) {
-        const raw = buffer.slice(0, idx).trim();
-        buffer = buffer.slice(idx + 2);
+      let i;
+      while ((i = buf.indexOf("\n\n")) !== -1) {
+        const chunk = buf.slice(0, i).trim();
+        buf = buf.slice(i + 2);
+        if (!chunk || !chunk.startsWith("data:")) continue;
 
-        if (!raw) continue;
-        if (!raw.startsWith("data:")) continue;
-
-        const payload = raw.slice(5).trim();
-        if (payload === "[DONE]") {
-          this.#finishRun(runId, run);
-          break;
-        }
-
+        const data = chunk.slice(5).trim();
+        if (data === "[DONE]") return this.#finish();
         try {
-          const json = JSON.parse(payload);
-          const delta = json?.choices?.[0]?.delta?.content ?? "";
+          const j = JSON.parse(data);
+          const delta = j?.choices?.[0]?.delta?.content ?? "";
           if (delta) {
-            const seq = ++run.seq;
-            // Buffer the delta
-            run.buffer.push({ runId, seq, text: delta });
-            // (Optional) Persist buffer in storage for cross-restart resume:
-            // await this.state.storage.put(`${runId}:${seq}`, delta);
-
-            // Broadcast to all connected sockets for this run
-            const msg = JSON.stringify({ type: "delta", runId, seq, text: delta });
-            for (const sock of run.sockets) {
-              try { sock.send(msg); } catch {}
-            }
+            const seq = ++this.seq;
+            this.buffer.push({ seq, text: delta });
+            this.#broadcast({ type: "delta", seq, text: delta });
           }
-
-          const finish = json?.choices?.[0]?.finish_reason;
-          if (finish) {
-            this.#finishRun(runId, run);
-            break;
-          }
-        } catch (e) {
-          // ignore parse errors of stray lines
-        }
+          const doneReason = j?.choices?.[0]?.finish_reason;
+          if (doneReason) return this.#finish();
+        } catch { /* ignore */ }
       }
     }
-
-    // safety close if stream ended without explicit finish
-    if (!run.finished && !run.error) this.#finishRun(runId, run);
+    this.#finish();
   }
 
-  #finishRun(runId, run) {
-    if (run.finished) return;
-    run.finished = true;
-    const msg = JSON.stringify({ type: "done", runId });
-    for (const sock of run.sockets) {
-      try { sock.send(msg); } catch {}
-    }
-    // You can compact buffer or persist final here if desired.
+  #finish() {
+    if (this.finished) return;
+    this.finished = true;
+    this.#broadcast({ type: "done" });
   }
 
-  #failRun(runId, run, message) {
-    run.error = String(message || "error");
-    const msg = JSON.stringify({ type: "err", runId, message: run.error });
-    for (const sock of run.sockets) {
-      try { sock.send(msg); } catch {}
-    }
+  #fail(message) {
+    this.error = message;
+    this.#broadcast({ type: "err", message });
+    this.finished = true;
   }
 }
