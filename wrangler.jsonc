@@ -4,7 +4,7 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "durable-object-starter",
+	"name": "orp",
 	"main": "src/index.js",
 	"compatibility_date": "2024-11-11",
 	"migrations": [
