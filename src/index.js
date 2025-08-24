@@ -109,48 +109,72 @@ export class MyDurableObject {
   }
 
   async stream({ apiKey, body }){
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions",{
-      method:"POST",
-      headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+apiKey },
-      body:JSON.stringify(body),
-      signal:this.controller.signal
-    }).catch(e=>({ ok:false, status:0, body:null, text:async()=>String(e?.message||"fetch_failed") }));
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions",{
+    method:"POST",
+    headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+apiKey },
+    body:JSON.stringify(body),
+    signal:this.controller.signal
+  }).catch(e=>({ ok:false, status:0, body:null, text:async()=>String(e?.message||"fetch_failed") }));
 
-    if (!res.ok || !res.body){
-      const t = await res.text().catch(()=> "");
-      return this.fail(t || ("HTTP "+res.status));
-    }
-
-    const dec = new TextDecoder(), reader = res.body.getReader();
-    let buf = "";
-    while (this.phase === "running"){
-      const { value, done } = await reader.read().catch(()=>({done:true}));
-      if (done) break;
-      buf += dec.decode(value,{stream:true});
-
-      let i;
-      while ((i = buf.indexOf("\n\n")) !== -1){
-        const chunk = buf.slice(0,i).trim(); buf = buf.slice(i+2);
-        if (!chunk || !chunk.startsWith("data:")) continue;
-
-        const data = chunk.slice(5).trim();
-        if (data === "[DONE]") return this.finish();
-
-        try{
-          const j = JSON.parse(data);
-          const delta = j?.choices?.[0]?.delta?.content ?? "";
-          if (delta){
-            const seq = ++this.seq;
-            this.buffer.push({ seq, text: delta });
-            this.bcast({ type:"delta", seq, text: delta });
-            this.saveSnapshot(); // persist progress for late resumes
-          }
-          if (j?.choices?.[0]?.finish_reason) return this.finish();
-        }catch{}
-      }
-    }
-    this.finish();
+  if (!res.ok || !res.body){
+    const t = await res.text().catch(()=> "");
+    return this.fail(t || ("HTTP "+res.status));
   }
+
+  const dec = new TextDecoder(), reader = res.body.getReader();
+  let buf = "", sawDone = false;
+
+  while (this.phase === "running"){
+    const { value, done } = await reader.read().catch(()=>({done:true}));
+    if (done) break;
+    buf += dec.decode(value,{stream:true});
+
+    let i;
+    while ((i = buf.indexOf("\n\n")) !== -1){
+      const chunk = buf.slice(0,i).trim(); buf = buf.slice(i+2);
+      if (!chunk || !chunk.startsWith("data:")) continue;
+
+      const data = chunk.slice(5).trim();
+      if (data === "[DONE]"){ sawDone = true; break; }
+
+      try{
+        const j = JSON.parse(data);
+        const delta = j?.choices?.[0]?.delta?.content ?? "";
+        if (delta){
+          const seq = ++this.seq;
+          this.buffer.push({ seq, text: delta });
+          this.bcast({ type:"delta", seq, text: delta });
+          this.saveSnapshot();
+        }
+        if (j?.choices?.[0]?.finish_reason) { sawDone = true; break; }
+      }catch{}
+    }
+    if (sawDone) break;
+  }
+
+  // Flush a trailing event lacking "\n\n"
+  const tail = buf.trim();
+  if (!sawDone && tail.startsWith("data:")){
+    const data = tail.slice(5).trim();
+    if (data !== "[DONE]"){
+      try{
+        const j = JSON.parse(data);
+        const delta = j?.choices?.[0]?.delta?.content ?? "";
+        if (delta){
+          const seq = ++this.seq;
+          this.buffer.push({ seq, text: delta });
+          this.bcast({ type:"delta", seq, text: delta });
+          this.saveSnapshot();
+        }
+        if (j?.choices?.[0]?.finish_reason) sawDone = true;
+      }catch{}
+    } else {
+      sawDone = true;
+    }
+  }
+
+  this.finish();
+}
 
   finish(){
     if (this.phase !== "running") return;
