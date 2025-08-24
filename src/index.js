@@ -18,10 +18,10 @@ export class MyDurableObject {
   }
 
   reset() {
-    this.rid = null;           // current run id
-    this.buffer = [];          // [{seq,text}]
+    this.rid = null;
+    this.buffer = [];      // [{seq,text}]
     this.seq = -1;
-    this.phase = "idle";       // idle|running|done|error
+    this.phase = "idle";   // idle|running|done|error
     this.error = null;
     this.controller = null;
   }
@@ -46,7 +46,7 @@ export class MyDurableObject {
 
   replay(ws, after) {
     for (const it of this.buffer) if (it.seq > after) this.send(ws, { type: "delta", seq: it.seq, text: it.text });
-    if (this.phase === "done") this.send(ws, { type: "done" });
+    if (this.phase === "done")  this.send(ws, { type: "done" });
     if (this.phase === "error") this.send(ws, { type: "err", message: this.error });
   }
 
@@ -66,12 +66,15 @@ export class MyDurableObject {
 
     if (m.type !== "begin") return this.send(ws, { type: "err", message: "bad_type" });
 
-    const { rid, apiKey, model, messages, after } = m;
-    if (!rid || !apiKey || !model || !Array.isArray(messages) || !messages.length)
+    const { rid, apiKey, or_body, model, messages, after } = m;
+
+    // Prefer full OpenRouter body (or_body); fallback to legacy model/messages.
+    const body = or_body || (model && Array.isArray(messages) ? { model, messages, stream: true } : null);
+    if (!rid || !apiKey || !body || !Array.isArray(body.messages) || body.messages.length === 0)
       return this.send(ws, { type: "err", message: "missing_fields" });
 
     if (this.phase === "running" && rid !== this.rid)
-      return this.send(ws, { type: "err", message: "busy" }); // client should abort previous first
+      return this.send(ws, { type: "err", message: "busy" });
 
     if (rid === this.rid && this.phase !== "idle") {
       const a = Number.isFinite(+after) ? +after : -1;
@@ -82,14 +85,14 @@ export class MyDurableObject {
     this.rid = rid;
     this.phase = "running";
     this.controller = new AbortController();
-    this.stream({ apiKey, model, messages }).catch(e => this.fail(String(e?.message || "stream_failed")));
+    this.stream({ apiKey, body }).catch(e => this.fail(String(e?.message || "stream_failed")));
   }
 
-  async stream({ apiKey, model, messages }) {
+  async stream({ apiKey, body }) {
     const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + apiKey },
-      body: JSON.stringify({ model, messages, stream: true }),
+      body: JSON.stringify(body),
       signal: this.controller.signal
     }).catch(e => ({ ok: false, status: 0, body: null, text: async () => String(e?.message || "fetch_failed") }));
 
