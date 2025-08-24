@@ -1,4 +1,4 @@
-const TTL_MS = 20601000; // snapshot TTL
+const TTL_MS = 20601000; // ~5.72h
 
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
@@ -34,12 +34,10 @@ export default {
   async fetch(req, env) {
     const u = new URL(req.url);
 
-    // CORS preflight
     if (req.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    // WebSocket streaming: /ws?uid=...
     if (u.pathname === "/ws") {
       const raw = u.searchParams.get("uid") || "anon";
       const uid = String(raw).slice(0, 64).replace(/[^a-zA-Z0-9_-]/g, "") || "anon";
@@ -47,31 +45,24 @@ export default {
       return env.MY_DURABLE_OBJECT.get(id).fetch(req);
     }
 
-    // REST: GET /chat/:uid -> return current snapshot for uid
     if (u.pathname.startsWith("/chat/") && req.method === "GET") {
       const raw = u.pathname.split("/")[2] || "";
       const uid = String(raw).slice(0, 64).replace(/[^a-zA-Z0-9_-]/g, "") || "anon";
       const id = env.MY_DURABLE_OBJECT.idFromName(uid);
-
       const r = new Request(new URL("https://do/snapshot"), { method: "GET", headers: req.headers });
       return env.MY_DURABLE_OBJECT.get(id).fetch(r);
     }
 
-    // Shortcut: GET /:uid
     const parts = u.pathname.split("/").filter(Boolean);
     if (req.method === "GET" && parts.length === 1 && parts[0] !== "ws" && parts[0] !== "chat") {
       const raw = parts[0] || "";
       const uid = String(raw).slice(0, 64).replace(/[^a-zA-Z0-9_-]/g, "") || "anon";
       const id = env.MY_DURABLE_OBJECT.idFromName(uid);
-
       const r = new Request(new URL("https://do/snapshot"), { method: "GET", headers: req.headers });
       return env.MY_DURABLE_OBJECT.get(id).fetch(r);
     }
 
-    if (u.pathname === "/healthz") {
-      return text("ok");
-    }
-
+    if (u.pathname === "/healthz") return text("ok");
     return text("not found", 404);
   }
 };
@@ -80,7 +71,6 @@ export class MyDurableObject {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-
     this.sockets = new Set();
     this.reset();
   }
@@ -88,28 +78,24 @@ export class MyDurableObject {
   reset() {
     this.rid = null;
     this.buffer = [];       // [{seq, text}]
-    this.full = "";         // aggregated assistant content
+    this.full = "";
     this.seq = -1;
     this.phase = "idle";    // idle | running | done | error
     this.error = null;
     this.controller = null;
-    this.savedAt = 0;       // last snapshot saved time
-    this.requestMessages = []; // last request body.messages (for context/recovery)
-    this.lastUpdateAt = 0;  // last delta arrival time
+    this.savedAt = 0;
+    this.requestMessages = [];
+    this.lastUpdateAt = 0;
   }
 
-  // Load last snapshot if within TTL when needed
   async restoreIfCold() {
     if (this.rid) return;
-
     const snap = await this.state.storage.get("run").catch(() => null);
     const fresh = snap && Date.now() - (snap.savedAt || 0) < TTL_MS;
-
     if (!fresh) {
       if (snap) await this.state.storage.delete("run").catch(() => {});
       return;
     }
-
     this.rid = snap.rid || null;
     this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
     this.full = typeof snap.full === "string" ? snap.full : (this.buffer.map(b => b.text).join("") || "");
@@ -140,20 +126,12 @@ export class MyDurableObject {
   bcast(o) {
     const s = JSON.stringify(o);
     for (const ws of this.sockets) {
-      try {
-        ws.send(s);
-      } catch {
-        // noop
-      }
+      try { ws.send(s); } catch {}
     }
   }
 
   send(ws, o) {
-    try {
-      ws.send(JSON.stringify(o));
-    } catch {
-      // noop
-    }
+    try { ws.send(JSON.stringify(o)); } catch {}
   }
 
   replay(ws, after) {
@@ -167,29 +145,23 @@ export class MyDurableObject {
   async fetch(req) {
     const u = new URL(req.url);
 
-    // HTTP GET snapshot endpoint for Worker to forward to.
     if (req.method === "GET" && u.pathname === "/snapshot" && req.headers.get("Upgrade") !== "websocket") {
       await this.restoreIfCold();
-
       const ttlRemaining = Math.max(0, (this.savedAt || 0) + TTL_MS - Date.now());
-      const body = {
+      return json({
         rid: this.rid,
         phase: this.phase,
         seq: this.seq,
         error: this.error,
         full: this.full || "",
-        // Buffer summary (you can include full buffer if desired)
         buffer_len: Array.isArray(this.buffer) ? this.buffer.length : 0,
         messages: this.requestMessages || [],
         savedAt: this.savedAt || 0,
         lastUpdateAt: this.lastUpdateAt || 0,
         ttlRemaining
-      };
-
-      return json(body);
+      });
     }
 
-    // WebSocket endpoint for streaming
     if (req.method !== "GET" || req.headers.get("Upgrade") !== "websocket") {
       return text("Expected websocket", 426);
     }
@@ -223,11 +195,8 @@ export class MyDurableObject {
     await this.restoreIfCold();
 
     let m;
-    try {
-      m = JSON.parse(String(evt.data || ""));
-    } catch {
-      return this.send(ws, { type: "err", message: "bad_json" });
-    }
+    try { m = JSON.parse(String(evt.data || "")); }
+    catch { return this.send(ws, { type: "err", message: "bad_json" }); }
 
     if (m.type === "resume") {
       if (!m.rid || m.rid !== this.rid) return this.send(ws, { type: "err", message: "stale_run" });
@@ -278,7 +247,7 @@ export class MyDurableObject {
         "Content-Type": "application/json",
         Authorization: "Bearer " + apiKey
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, stream: true }),
       signal: this.controller.signal
     }).catch((e) => ({
       ok: false,
@@ -294,23 +263,9 @@ export class MyDurableObject {
 
     const dec = new TextDecoder();
     const reader = res.body.getReader();
+
     let buf = "";
-    let done = false;
-
-    const cut = (s) => {
-      const a = s.indexOf("\n\n");
-      const b = s.indexOf("\r\n\r\n");
-      return a < 0 ? b : b < 0 ? a : Math.min(a, b);
-    };
-
-    const take = () => {
-      const i = cut(buf);
-      if (i < 0) return null;
-      const ch = buf.slice(0, i);
-      const delimLen = buf[i] === "\r" ? 4 : 2;
-      buf = buf.slice(i + delimLen);
-      return ch;
-    };
+    let doneSignal = false;
 
     const push = (d) => {
       const seq = ++this.seq;
@@ -321,82 +276,72 @@ export class MyDurableObject {
       this.saveSnapshot();
     };
 
-    while (this.phase === "running") {
-      const r = await reader.read().catch(() => ({ done: true }));
-      if (r.done) break;
-      buf += dec.decode(r.value, { stream: true });
+    try {
+      while (this.phase === "running") {
+        const { done, value } = await reader.read().catch(() => ({ done: true }));
+        if (done) break;
 
-      for (let ch; (ch = take()); ) {
-        const t = ch.replace(/\r\n/g, "\n").trim();
-        if (!t || !t.startsWith("data:")) continue;
+        buf += dec.decode(value, { stream: true });
 
-        let stop = false;
-        for (const line of t.split("\n")) {
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
+        // Process complete lines
+        // Per OpenRouter docs: parse by newline; lines start with "data: " or ":" comments; [DONE] terminates.
+        while (true) {
+          const idx = buf.indexOf("\n");
+          if (idx === -1) break;
 
-          if (data === "[DONE]") {
-            done = true;
-            stop = true;
-            break;
+          const rawLine = buf.slice(0, idx);
+          buf = buf.slice(idx + 1);
+
+          const line = rawLine.trimEnd(); // keep leading spaces for "data: "
+          if (!line) continue;
+
+          if (line.startsWith(":")) {
+            // SSE comment keep-alive, ignore.
+            continue;
           }
 
-          try {
-            const j = JSON.parse(data);
-            const d = j?.choices?.[0]?.delta?.content ?? "";
-            if (d) push(d);
-            if (j?.choices?.[0]?.finish_reason) {
-              done = true;
-              stop = true;
-              break;
+          if (line.startsWith("data:")) {
+            const data = line.slice(5).trimStart();
+
+            if (data === "[DONE]") {
+              doneSignal = true;
+              break; // exit inner; outer will break on next iteration
             }
-          } catch {
-            // ignore parse errors for partial/keep-alive chunks
+
+            try {
+              const j = JSON.parse(data);
+              const d = j?.choices?.[0]?.delta?.content ?? "";
+              if (d) push(d);
+              const fr = j?.choices?.[0]?.finish_reason;
+              if (fr && fr !== null) {
+                doneSignal = true;
+                break;
+              }
+            } catch {
+              // ignore partial or non-JSON payloads
+            }
           }
         }
 
-        if (stop) break;
+        if (doneSignal) break;
       }
-
-      if (done) break;
+    } finally {
+      try { await reader.cancel(); } catch {}
     }
 
-    // tail recovery
-    const tail = (buf + dec.decode()).replace(/\r\n/g, "\n");
-    if (!done && tail) {
-      for (const seg of tail.split("\n\n")) {
-        const t = seg.trim();
-        if (!t || !t.startsWith("data:")) continue;
-
-        const data = t.slice(5).trim();
-        if (data === "[DONE]") {
-          done = true;
-          break;
-        }
-
-        try {
-          const j = JSON.parse(data);
-          const d = j?.choices?.[0]?.delta?.content ?? "";
-          if (d) push(d);
-          if (j?.choices?.[0]?.finish_reason) {
-            done = true;
-            break;
-          }
-        } catch {
-          // ignore parse errors
-        }
-      }
+    // After stream closes, decide terminal state
+    if (doneSignal) {
+      this.finish();
+    } else {
+      // No explicit [DONE] or finish_reason → treat as incomplete
+      this.fail("stream_incomplete");
     }
-
-    this.finish();
   }
 
   finish() {
     if (this.phase !== "running") return;
     this.phase = "done";
-    try {
-      this.controller?.abort();
-    } catch {}
+    try { this.controller?.abort(); } catch {}
     this.lastUpdateAt = Date.now();
     this.saveSnapshot();
     this.bcast({ type: "done" });
@@ -405,9 +350,7 @@ export class MyDurableObject {
   stop() {
     if (this.phase !== "running") return;
     this.phase = "done";
-    try {
-      this.controller?.abort();
-    } catch {}
+    try { this.controller?.abort(); } catch {}
     this.lastUpdateAt = Date.now();
     this.saveSnapshot();
     this.bcast({ type: "done" });
@@ -417,9 +360,7 @@ export class MyDurableObject {
     if (this.phase === "error") return;
     this.phase = "error";
     this.error = message;
-    try {
-      this.controller?.abort();
-    } catch {}
+    try { this.controller?.abort(); } catch {}
     this.lastUpdateAt = Date.now();
     this.saveSnapshot();
     this.bcast({ type: "err", message });
