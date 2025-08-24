@@ -13,11 +13,16 @@ export class MyDurableObject {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.buffer = [];
-    this.seq = -1;
-    this.phase = "idle"; // idle | running | done | error
-    this.error = null;
     this.sockets = new Set();
+    this.reset();
+  }
+
+  reset() {
+    this.rid = null;           // current run id
+    this.buffer = [];          // [{seq,text}]
+    this.seq = -1;
+    this.phase = "idle";       // idle|running|done|error
+    this.error = null;
     this.controller = null;
   }
 
@@ -31,77 +36,117 @@ export class MyDurableObject {
 
     this.sockets.add(server);
     server.addEventListener("close", () => this.sockets.delete(server));
-    server.addEventListener("message", e => this.#onMessage(server, e));
+    server.addEventListener("message", (e) => this.onMessage(server, e));
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  #send(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch {} }
-  #broadcast(obj) {
-    const s = JSON.stringify(obj);
-    for (const ws of this.sockets) { try { ws.send(s) } catch {} }
-  }
-  #replay(ws, after) {
-    for (const it of this.buffer) if (it.seq > after) this.#send(ws, { type:"delta", ...it });
-    if (this.phase === "done") this.#send(ws, { type:"done" });
-    if (this.phase === "error") this.#send(ws, { type:"err", message:this.error });
+  send(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch {} }
+  bcast(obj) { const s = JSON.stringify(obj); for (const ws of this.sockets) { try { ws.send(s) } catch {} } }
+
+  replay(ws, after) {
+    for (const it of this.buffer) if (it.seq > after) this.send(ws, { type: "delta", seq: it.seq, text: it.text });
+    if (this.phase === "done") this.send(ws, { type: "done" });
+    if (this.phase === "error") this.send(ws, { type: "err", message: this.error });
   }
 
-  async #onMessage(ws, e) {
-    let msg; try { msg = JSON.parse(String(e.data||"")); } catch { return this.#send(ws,{type:"err",message:"bad_json"}) }
-    if (msg.type === "resume") return this.#replay(ws, +msg.after||-1);
-    if (msg.type === "stop") return this.#stop("client");
-    if (msg.type !== "begin") return this.#send(ws,{type:"err",message:"bad_type"});
+  async onMessage(ws, evt) {
+    let m; try { m = JSON.parse(String(evt.data || "")); } catch { return this.send(ws, { type: "err", message: "bad_json" }) }
 
-    const { apiKey, model, messages, after } = msg;
-    if (!apiKey || !model || !Array.isArray(messages) || !messages.length)
-      return this.#send(ws,{type:"err",message:"missing_fields"});
+    if (m.type === "resume") {
+      if (!m.rid || m.rid !== this.rid) return this.send(ws, { type: "err", message: "stale_run" });
+      const after = Number.isFinite(+m.after) ? +m.after : -1;
+      return this.replay(ws, after);
+    }
 
-    this.#replay(ws, +after||-1);
-    if (this.phase === "running") return;
+    if (m.type === "stop") {
+      if (m.rid && m.rid === this.rid) this.stop("client");
+      return;
+    }
 
-    this.buffer=[]; this.seq=-1; this.error=null;
-    this.phase="running"; this.controller=new AbortController();
-    this.#stream({apiKey,model,messages}).catch(e=>this.#fail(String(e?.message||"stream_failed")));
+    if (m.type !== "begin") return this.send(ws, { type: "err", message: "bad_type" });
+
+    const { rid, apiKey, model, messages, after } = m;
+    if (!rid || !apiKey || !model || !Array.isArray(messages) || !messages.length)
+      return this.send(ws, { type: "err", message: "missing_fields" });
+
+    if (this.phase === "running" && rid !== this.rid)
+      return this.send(ws, { type: "err", message: "busy" }); // client should abort previous first
+
+    if (rid === this.rid && this.phase !== "idle") {
+      const a = Number.isFinite(+after) ? +after : -1;
+      return this.replay(ws, a);
+    }
+
+    this.reset();
+    this.rid = rid;
+    this.phase = "running";
+    this.controller = new AbortController();
+    this.stream({ apiKey, model, messages }).catch(e => this.fail(String(e?.message || "stream_failed")));
   }
 
-  async #stream({apiKey,model,messages}) {
+  async stream({ apiKey, model, messages }) {
     const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method:"POST",
-      headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+apiKey },
-      body: JSON.stringify({ model, messages, stream:true }),
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + apiKey },
+      body: JSON.stringify({ model, messages, stream: true }),
       signal: this.controller.signal
-    });
-    if (!res.ok || !res.body) return this.#fail("HTTP "+res.status);
+    }).catch(e => ({ ok: false, status: 0, body: null, text: async () => String(e?.message || "fetch_failed") }));
 
-    const dec=new TextDecoder(), reader=res.body.getReader();
-    let buf="";
-    while (this.phase==="running") {
-      const {value,done}=await reader.read().catch(()=>({done:true}));
+    if (!res.ok || !res.body) {
+      const t = await res.text().catch(() => "");
+      return this.fail(t || ("HTTP " + res.status));
+    }
+
+    const dec = new TextDecoder(), reader = res.body.getReader();
+    let buf = "";
+    while (this.phase === "running") {
+      const { value, done } = await reader.read().catch(() => ({ done: true }));
       if (done) break;
-      buf+=dec.decode(value,{stream:true});
+      buf += dec.decode(value, { stream: true });
+
       let i;
-      while((i=buf.indexOf("\\n\\n"))!==-1){
-        const chunk=buf.slice(0,i).trim(); buf=buf.slice(i+2);
-        if(!chunk||!chunk.startsWith("data:"))continue;
-        const data=chunk.slice(5).trim();
-        if(data==="[DONE]") return this.#finish();
-        try{
-          const j=JSON.parse(data);
-          const delta=j?.choices?.[0]?.delta?.content??"";
-          if(delta){
-            const seq=++this.seq;
-            this.buffer.push({seq,text:delta});
-            this.#broadcast({type:"delta",seq,text:delta});
+      while ((i = buf.indexOf("\n\n")) !== -1) {
+        const chunk = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+        if (!chunk || !chunk.startsWith("data:")) continue;
+
+        const data = chunk.slice(5).trim();
+        if (data === "[DONE]") return this.finish();
+
+        try {
+          const j = JSON.parse(data);
+          const delta = j?.choices?.[0]?.delta?.content ?? "";
+          if (delta) {
+            const seq = ++this.seq;
+            this.buffer.push({ seq, text: delta });
+            this.bcast({ type: "delta", seq, text: delta });
           }
-          if(j?.choices?.[0]?.finish_reason) return this.#finish();
-        }catch{}
+          if (j?.choices?.[0]?.finish_reason) return this.finish();
+        } catch {}
       }
     }
-    this.#finish();
+    this.finish();
   }
 
-  #finish(){ if(this.phase!=="running")return; this.phase="done"; this.controller?.abort(); this.#broadcast({type:"done"}); }
-  #stop(){ if(this.phase!=="running")return; this.phase="done"; this.controller?.abort(); this.#broadcast({type:"done"}); }
-  #fail(msg){ if(this.phase==="done"||this.phase==="error")return; this.phase="error"; this.error=msg; this.controller?.abort(); this.#broadcast({type:"err",message:msg}); }
+  finish() {
+    if (this.phase !== "running") return;
+    this.phase = "done";
+    try { this.controller?.abort(); } catch {}
+    this.bcast({ type: "done" });
+  }
+
+  stop() {
+    if (this.phase !== "running") return;
+    this.phase = "done";
+    try { this.controller?.abort(); } catch {}
+    this.bcast({ type: "done" });
+  }
+
+  fail(message) {
+    if (this.phase === "error") return;
+    this.phase = "error";
+    this.error = message;
+    try { this.controller?.abort(); } catch {}
+    this.bcast({ type: "err", message });
+  }
 }
