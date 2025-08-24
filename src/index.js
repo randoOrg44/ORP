@@ -1,15 +1,78 @@
-const TTL_MS = 20601000;
+const TTL_MS = 20601000; // snapshot TTL
+
+const CORS_HEADERS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET,OPTIONS",
+  "access-control-allow-headers": "*",
+};
+
+function json(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      ...CORS_HEADERS,
+      ...extraHeaders
+    }
+  });
+}
+
+function text(s, status = 200, extraHeaders = {}) {
+  return new Response(String(s), {
+    status,
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      "cache-control": "no-store",
+      ...CORS_HEADERS,
+      ...extraHeaders
+    }
+  });
+}
 
 export default {
   async fetch(req, env) {
     const u = new URL(req.url);
+
+    // CORS preflight
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    // WebSocket streaming: /ws?uid=...
     if (u.pathname === "/ws") {
       const raw = u.searchParams.get("uid") || "anon";
       const uid = String(raw).slice(0, 64).replace(/[^a-zA-Z0-9_-]/g, "") || "anon";
       const id = env.MY_DURABLE_OBJECT.idFromName(uid);
       return env.MY_DURABLE_OBJECT.get(id).fetch(req);
     }
-    return new Response("not found", { status: 404, headers: { "content-type": "text/plain" } });
+
+    // REST: GET /chat/:uid -> return current snapshot for uid
+    if (u.pathname.startsWith("/chat/") && req.method === "GET") {
+      const raw = u.pathname.split("/")[2] || "";
+      const uid = String(raw).slice(0, 64).replace(/[^a-zA-Z0-9_-]/g, "") || "anon";
+      const id = env.MY_DURABLE_OBJECT.idFromName(uid);
+
+      const r = new Request(new URL("https://do/snapshot"), { method: "GET", headers: req.headers });
+      return env.MY_DURABLE_OBJECT.get(id).fetch(r);
+    }
+
+    // Shortcut: GET /:uid
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (req.method === "GET" && parts.length === 1 && parts[0] !== "ws" && parts[0] !== "chat") {
+      const raw = parts[0] || "";
+      const uid = String(raw).slice(0, 64).replace(/[^a-zA-Z0-9_-]/g, "") || "anon";
+      const id = env.MY_DURABLE_OBJECT.idFromName(uid);
+
+      const r = new Request(new URL("https://do/snapshot"), { method: "GET", headers: req.headers });
+      return env.MY_DURABLE_OBJECT.get(id).fetch(r);
+    }
+
+    if (u.pathname === "/healthz") {
+      return text("ok");
+    }
+
+    return text("not found", 404);
   }
 };
 
@@ -17,22 +80,118 @@ export class MyDurableObject {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+
     this.sockets = new Set();
     this.reset();
   }
 
   reset() {
     this.rid = null;
-    this.buffer = [];
+    this.buffer = [];       // [{seq, text}]
+    this.full = "";         // aggregated assistant content
     this.seq = -1;
-    this.phase = "idle";
+    this.phase = "idle";    // idle | running | done | error
     this.error = null;
     this.controller = null;
+    this.savedAt = 0;       // last snapshot saved time
+    this.requestMessages = []; // last request body.messages (for context/recovery)
+    this.lastUpdateAt = 0;  // last delta arrival time
+  }
+
+  // Load last snapshot if within TTL when needed
+  async restoreIfCold() {
+    if (this.rid) return;
+
+    const snap = await this.state.storage.get("run").catch(() => null);
+    const fresh = snap && Date.now() - (snap.savedAt || 0) < TTL_MS;
+
+    if (!fresh) {
+      if (snap) await this.state.storage.delete("run").catch(() => {});
+      return;
+    }
+
+    this.rid = snap.rid || null;
+    this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
+    this.full = typeof snap.full === "string" ? snap.full : (this.buffer.map(b => b.text).join("") || "");
+    this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
+    this.phase = snap.phase || "done";
+    this.error = snap.error || null;
+    this.savedAt = Number.isFinite(+snap.savedAt) ? +snap.savedAt : Date.now();
+    this.requestMessages = Array.isArray(snap.requestMessages) ? snap.requestMessages : [];
+    this.lastUpdateAt = Number.isFinite(+snap.lastUpdateAt) ? +snap.lastUpdateAt : this.savedAt;
+  }
+
+  saveSnapshot() {
+    const data = {
+      rid: this.rid,
+      buffer: this.buffer,
+      full: this.full,
+      seq: this.seq,
+      phase: this.phase,
+      error: this.error,
+      requestMessages: this.requestMessages,
+      lastUpdateAt: this.lastUpdateAt,
+      savedAt: Date.now()
+    };
+    this.savedAt = data.savedAt;
+    this.state.storage.put("run", data).catch(() => {});
+  }
+
+  bcast(o) {
+    const s = JSON.stringify(o);
+    for (const ws of this.sockets) {
+      try {
+        ws.send(s);
+      } catch {
+        // noop
+      }
+    }
+  }
+
+  send(ws, o) {
+    try {
+      ws.send(JSON.stringify(o));
+    } catch {
+      // noop
+    }
+  }
+
+  replay(ws, after) {
+    for (const it of this.buffer) {
+      if (it.seq > after) this.send(ws, { type: "delta", seq: it.seq, text: it.text });
+    }
+    if (this.phase === "done") this.send(ws, { type: "done" });
+    if (this.phase === "error") this.send(ws, { type: "err", message: this.error });
   }
 
   async fetch(req) {
+    const u = new URL(req.url);
+
+    // HTTP GET snapshot endpoint for Worker to forward to.
+    if (req.method === "GET" && u.pathname === "/snapshot" && req.headers.get("Upgrade") !== "websocket") {
+      await this.restoreIfCold();
+
+      const ttlRemaining = Math.max(0, (this.savedAt || 0) + TTL_MS - Date.now());
+      const body = {
+        rid: this.rid,
+        phase: this.phase,
+        seq: this.seq,
+        error: this.error,
+        full: this.full || "",
+        // Buffer summary (you can include full buffer if desired)
+        buffer_len: Array.isArray(this.buffer) ? this.buffer.length : 0,
+        messages: this.requestMessages || [],
+        savedAt: this.savedAt || 0,
+        lastUpdateAt: this.lastUpdateAt || 0,
+        ttlRemaining
+      };
+
+      return json(body);
+    }
+
+    // WebSocket endpoint for streaming
     if (req.method !== "GET" || req.headers.get("Upgrade") !== "websocket") {
-      return new Response("Expected websocket", { status: 426, headers: { "content-type": "text/plain" } });
+      return text("Expected websocket", 426);
     }
 
     const pair = new WebSocketPair();
@@ -53,69 +212,11 @@ export class MyDurableObject {
 
     server.addEventListener("message", (e) => {
       Promise.resolve(this.onMessage(server, e)).catch(() => {
-        // Don't throw from event handler; send a soft error back if possible
         this.send(server, { type: "err", message: "internal_error" });
       });
     });
 
     return new Response(null, { status: 101, webSocket: client });
-  }
-
-  send(ws, o) {
-    try {
-      ws.send(JSON.stringify(o));
-    } catch {
-      // no-op
-    }
-  }
-
-  bcast(o) {
-    const s = JSON.stringify(o);
-    for (const ws of this.sockets) {
-      try {
-        ws.send(s);
-      } catch {
-        // no-op
-      }
-    }
-  }
-
-  async restoreIfCold() {
-    if (this.rid) return;
-
-    const snap = await this.state.storage.get("run").catch(() => null);
-    const fresh = snap && Date.now() - (snap.savedAt || 0) < TTL_MS;
-
-    if (!fresh) {
-      if (snap) await this.state.storage.delete("run").catch(() => {});
-      return;
-    }
-
-    this.rid = snap.rid || null;
-    this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
-    this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
-    this.phase = snap.phase || "done";
-    this.error = snap.error || null;
-  }
-
-  saveSnapshot() {
-    const data = {
-      rid: this.rid,
-      buffer: this.buffer,
-      seq: this.seq,
-      phase: this.phase,
-      error: this.error,
-      savedAt: Date.now()
-    };
-    this.state.storage.put("run", data).catch(() => {});
-  }
-
-  replay(ws, after) {
-    for (const it of this.buffer) {
-      if (it.seq > after) this.send(ws, { type: "delta", seq: it.seq, text: it.text });
-    }
-    if (this.phase === "done") this.send(ws, { type: "done" });
-    if (this.phase === "error") this.send(ws, { type: "err", message: this.error });
   }
 
   async onMessage(ws, evt) {
@@ -157,10 +258,14 @@ export class MyDurableObject {
       return this.replay(ws, a);
     }
 
+    // Fresh run
     this.reset();
     this.rid = rid;
     this.phase = "running";
     this.controller = new AbortController();
+    this.requestMessages = Array.isArray(body.messages) ? body.messages : [];
+    this.full = "";
+    this.lastUpdateAt = Date.now();
     this.saveSnapshot();
 
     this.stream({ apiKey, body }).catch((e) => this.fail(String(e?.message || "stream_failed")));
@@ -210,6 +315,8 @@ export class MyDurableObject {
     const push = (d) => {
       const seq = ++this.seq;
       this.buffer.push({ seq, text: d });
+      this.full += d;
+      this.lastUpdateAt = Date.now();
       this.bcast({ type: "delta", seq, text: d });
       this.saveSnapshot();
     };
@@ -254,6 +361,7 @@ export class MyDurableObject {
       if (done) break;
     }
 
+    // tail recovery
     const tail = (buf + dec.decode()).replace(/\r\n/g, "\n");
     if (!done && tail) {
       for (const seg of tail.split("\n\n")) {
@@ -289,6 +397,7 @@ export class MyDurableObject {
     try {
       this.controller?.abort();
     } catch {}
+    this.lastUpdateAt = Date.now();
     this.saveSnapshot();
     this.bcast({ type: "done" });
   }
@@ -299,6 +408,7 @@ export class MyDurableObject {
     try {
       this.controller?.abort();
     } catch {}
+    this.lastUpdateAt = Date.now();
     this.saveSnapshot();
     this.bcast({ type: "done" });
   }
@@ -310,6 +420,7 @@ export class MyDurableObject {
     try {
       this.controller?.abort();
     } catch {}
+    this.lastUpdateAt = Date.now();
     this.saveSnapshot();
     this.bcast({ type: "err", message });
   }
