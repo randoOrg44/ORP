@@ -59,20 +59,21 @@ export default {
  * The WebSocket "begin" message should include:
  * - provider: "openrouter" | "openai" (defaults to "openrouter" if missing/invalid)
  * - apiKey: string
- * - or_body: the chat completions body built by the client (model, messages, stream, sampling)
+ * - or_body: legacy chat-style body built by the client ({ model, messages, ... })
  *   (for backward compatibility, we also accept "body" or { model, messages } combo)
  *
- * Parameter handling:
+ * Parameter handling (Responses API):
  * - Shared and passed to BOTH OpenRouter and OpenAI:
  *   - temperature
  *   - top_p
  *   - frequency_penalty
  *   - presence_penalty
- *   - max_tokens
- *   - reasoning.effort (if present)
- *   - verbosity (if present)
+ *   - max_output_tokens  (mapped from max_tokens if present)
+ *   - reasoning: { effort, summary? }
+ *   - verbosity
+ *   - tools, tool_choice, stop, etc. (passed through if present)
  *
- * - OpenRouter-only (removed for OpenAI, passed through for OpenRouter):
+ * - OpenRouter-only parameters (removed for OpenAI):
  *   - top_k
  *   - repetition_penalty
  *   - min_p
@@ -263,45 +264,51 @@ export class MyDurableObject {
   }
 
   /**
-   * Sanitize/shape the body for the selected provider.
-   * - Always enforces stream: true
-   * - OpenAI: strips params it doesn't accept (top_k, repetition_penalty, min_p, top_a)
+   * Convert an incoming chat-style body into a Responses API request.
+   * - Ensures stream:true
+   * - Converts {messages:[{role,content}]} -> input:[{role,content}]
+   * - Maps max_tokens -> max_output_tokens
+   * - Removes OpenRouter-only params for OpenAI
    */
   sanitizeBodyForProvider(provider, input) {
     const body = { ...(input || {}) };
 
-    // Ensure stream is on
+    // Prefer body.input if caller already provided Responses schema.
+    // Otherwise convert chat-style messages -> input.
+    if (!body.input) {
+      if (Array.isArray(body.messages)) {
+        body.input = body.messages.map(m => ({
+          role: m.role,
+          content: m.content
+        }));
+        delete body.messages;
+      } else if (typeof body.prompt === 'string') {
+        body.input = [{ role: 'user', content: body.prompt }];
+        delete body.prompt;
+      }
+    }
+
+    // Stream on
     body.stream = true;
 
+    // Token mapping
+    if (body.max_tokens != null && body.max_output_tokens == null) {
+      body.max_output_tokens = body.max_tokens;
+      delete body.max_tokens;
+    }
+
     if (provider === 'openai') {
-      // Remove OpenRouter-only sampling params not accepted by OpenAI Chat Completions:
-      //   - top_k
-      //   - repetition_penalty
-      //   - min_p
-      //   - top_a
+      // Remove params not accepted by OpenAI Responses
       delete body.top_k;
       delete body.repetition_penalty;
       delete body.min_p;
       delete body.top_a;
-
-      // Allowed/passed-through to OpenAI (from what we use):
-      // - model
-      // - messages
-      // - stream
-      // - temperature
-      // - top_p
-      // - frequency_penalty
-      // - presence_penalty
-      // - max_tokens
-      // - reasoning: { effort }  (OAI accepts effort)
-      // - verbosity              (OAI accepts)
-      //
-      // We leave other common fields alone if present (tools, tool_choice, stop, etc.).
+      // OpenAI Responses accepts: model, input, temperature, top_p, frequency_penalty,
+      // presence_penalty, max_output_tokens, reasoning, verbosity, tools, tool_choice, stop, etc.
     } else {
       // provider === 'openrouter'
-      // Pass-through all parameters — OpenRouter supports the extended set:
-      // - temperature, top_p, top_k, frequency_penalty, presence_penalty,
-      //   repetition_penalty, min_p, top_a, max_tokens, reasoning.effort, verbosity, etc.
+      // Pass-through extended sampling params supported by OpenRouter.
+      // No changes needed.
     }
 
     return body;
@@ -334,18 +341,26 @@ export class MyDurableObject {
       rid,
       apiKey,
       provider: provRaw,
-      or_body,              // frontend sends 'or_body'
+      or_body,              // frontend may send 'or_body' (chat-style or responses-style)
       body,                 // also accept 'body' if present
       model,
-      messages,
+      messages,             // legacy fallback
       after
     } = m;
 
     const provider = this.normalizeProvider(provRaw);
-    // Accept or_body, or generic body, or last-resort fallback { model, messages }
-    const rawBody = or_body || body || (model && Array.isArray(messages) ? { model, messages, stream: true } : null);
 
-    if (!rid || !apiKey || !rawBody || !Array.isArray(rawBody.messages) || rawBody.messages.length === 0) {
+    // Produce a raw body from any of the accepted shapes
+    let rawBody = or_body || body || null;
+    if (!rawBody && model && Array.isArray(messages)) {
+      rawBody = { model, messages, stream: true };
+    }
+
+    // Validate minimal fields
+    const hasMessages = rawBody && Array.isArray(rawBody.messages) && rawBody.messages.length > 0;
+    const hasInput = rawBody && (rawBody.input || rawBody.prompt);
+    const hasModel = rawBody && rawBody.model;
+    if (!rid || !apiKey || !rawBody || !hasModel || (!hasMessages && !hasInput)) {
       return this.send(ws, { type: 'err', message: 'missing_fields' });
     }
 
@@ -376,38 +391,54 @@ export class MyDurableObject {
       baseURL: provider === 'openai' ? 'https://api.openai.com/v1' : 'https://openrouter.ai/api/v1',
     });
 
-    let finishReason = null;
-
     try {
-      const params = { ...body, stream: true };
-      const stream = await client.chat.completions.create(params, { signal: this.controller.signal });
+      // OpenAI SDK Responses streaming
+      const stream = await client.responses.stream({ ...body }, { signal: this.controller.signal });
 
-      for await (const chunk of stream) {
-        if (this.phase !== 'running') {
-          // likely stopped elsewhere; just break
-          break;
+      for await (const event of stream) {
+        if (this.phase !== 'running') break;
+
+        // Text deltas
+        if (event.type === 'response.output_text.delta') {
+          const delta = event.delta || '';
+          if (delta) this.queueDelta(delta);
         }
-        const delta = chunk?.choices?.[0]?.delta?.content ?? '';
-        if (delta) this.queueDelta(delta);
-        const fr = chunk?.choices?.[0]?.finish_reason;
-        if (fr) finishReason = fr;
+
+        // Some providers emit message deltas
+        if (event.type === 'response.message.delta') {
+          // event.delta may be structured; prefer text deltas above.
+          const parts = event.delta?.content || [];
+          for (const p of parts) {
+            if (p.type === 'output_text' && p.text) this.queueDelta(p.text);
+          }
+        }
+
+        // Completed
+        if (event.type === 'response.completed') {
+          // stream.finalResponse() returns the full response if needed
+          this.finish('completed');
+        }
+
+        // Error event
+        if (event.type === 'response.error') {
+          const msg = event.error?.message || 'stream_failed';
+          return this.fail(msg);
+        }
+      }
+
+      // If stream ends without explicit completed and we are still running
+      if (this.phase === 'running') {
+        this.finish('done');
       }
     } catch (e) {
-      // If aborted due to stop(), do nothing here; stop() handles appending reason and finishing.
       if (this.phase === 'running') {
         const msg = String(e?.message || 'stream_failed');
         if ((e && e.name === 'AbortError') || /abort/i.test(msg)) {
-          // stop() will append reason and finalize
+          // stop() will mark completion
           return;
         }
         return this.fail(msg);
       }
-      return;
-    }
-
-    // Normal finish via streaming end
-    if (this.phase === 'running') {
-      this.finish(finishReason || 'done');
     }
   }
 
