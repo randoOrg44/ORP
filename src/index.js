@@ -284,61 +284,110 @@ export class MyDurableObject {
     await this.streamOpenRouter({ apiKey, body });
   }
 
-  // Map chat-style message parts to OpenAI Responses API input content
+  // ======== Responses API helpers (text-only vs multimodal) ========
+
+  // Determine if a message is multimodal based on its content parts
+  isMultimodalMessage(m) {
+    if (!m) return false;
+    if (Array.isArray(m.content)) {
+      return m.content.some(p => {
+        const t = (p && p.type) || '';
+        if (t === 'image_url' || t === 'input_image') return true;
+        // Treat any explicit non-text type as multimodal
+        return t && t !== 'text' && t !== 'input_text';
+      });
+    }
+    return false;
+  }
+
+  // Extract concatenated text from a message that is considered text-only
+  extractTextFromMessage(m) {
+    if (!m) return '';
+    if (typeof m.content === 'string') return String(m.content);
+    if (Array.isArray(m.content)) {
+      return m.content
+        .filter(p => (p && (p.type === 'text' || p.type === 'input_text')))
+        .map(p => {
+          if (p.type === 'text') return String(p.text ?? p.content ?? '');
+          return String(p.text ?? '');
+        })
+        .join('');
+    }
+    return '';
+  }
+
+  // Map a single content part into Responses API typed content (multimodal only)
   mapContentPartToResponses(part) {
     const t = (part && part.type) || 'text';
 
-    if (t === 'text') {
-      // Convert to input_text
-      return { type: 'input_text', text: String(part.text || '') };
-    }
-
-    if (t === 'image_url') {
+    if (t === 'image_url' || t === 'input_image') {
       const url = part?.image_url?.url || part?.image_url || '';
       if (url) return { type: 'input_image', image_url: String(url) };
-      // Fallback to text if no URL
-      return { type: 'input_text', text: '' };
+      return null;
     }
 
-    // Unsupported inline for Responses without file upload: degrade to text
-    if (t === 'file') {
-      const fname = part?.file?.filename || 'file';
-      return { type: 'input_text', text: `[file:${fname}]` };
+    if (t === 'text' || t === 'input_text') {
+      const txt = (t === 'text')
+        ? String(part.text || part.content || '')
+        : String(part.text || '');
+      return { type: 'input_text', text: txt };
     }
 
-    if (t === 'input_audio') {
-      const fmt = part?.input_audio?.format || 'audio';
-      return { type: 'input_text', text: `[audio:${fmt}]` };
-    }
-
-    // Any unknown -> input_text fallback
-    return { type: 'input_text', text: '' };
+    // Degrade unsupported types into a textual marker
+    const name = part?.file?.filename || 'file';
+    return { type: 'input_text', text: `[${t}:${name}]` };
   }
 
-  // New: Direct OpenAI Responses API streaming path
+  // Build Responses API "input" value according to best practices:
+  // - Text-only: string (single-turn) or [{ role, content: string }, ...] (multi-turn)
+  // - Multimodal: [{ role, content: [{ type, ... }, ...] }, ...]
+  buildInputForResponses(messages) {
+    if (!Array.isArray(messages) || messages.length === 0) return '';
+
+    const isMulti = messages.some(m => this.isMultimodalMessage(m));
+
+    if (!isMulti) {
+      // Pure text-only
+      if (messages.length === 1) {
+        return this.extractTextFromMessage(messages[0]);
+      }
+      return messages.map(m => ({
+        role: m.role,
+        content: this.extractTextFromMessage(m),
+      }));
+    }
+
+    // Multimodal
+    return messages.map(m => {
+      let content = [];
+      if (Array.isArray(m.content)) {
+        content = m.content
+          .map(p => this.mapContentPartToResponses(p))
+          .filter(Boolean);
+      } else {
+        // If provided as a string within a multimodal session, wrap as input_text
+        content = [{ type: 'input_text', text: String(m.content || '') }];
+      }
+      return { role: m.role, content };
+    });
+  }
+
+  // New: Direct OpenAI Responses API streaming path (fixed for text-only vs multimodal)
   async streamOpenAI({ apiKey, body }) {
     const client = new OpenAI({ apiKey });
 
-    // Translate chat.completions-style body to Responses API (roles + content[])
-    const input = Array.isArray(body.messages)
-      ? body.messages.map(m => ({
-          role: m.role,
-          content: Array.isArray(m.content)
-            ? m.content.map(p => this.mapContentPartToResponses(p))
-            : [{ type: 'input_text', text: String(m.content || '') }]
-        }))
-      : [];
+    // Build "input" correctly per Responses API expectations
+    const input = this.buildInputForResponses(body.messages || []);
 
-    // Build params (include only supported/common controls)
+    // Build params (Responses API fields)
     const params = {
       model: body.model,
       input,
       temperature: body.temperature,
-      //top_p: body.top_p,
       stream: true,
     };
     if (Number.isFinite(+body.max_tokens) && +body.max_tokens > 0) {
-      // Responses API uses max_output_tokens
+      // Responses API uses max_output_tokens instead of max_tokens
       params.max_output_tokens = +body.max_tokens;
     }
     if (body.reasoning && body.reasoning.effort) {
@@ -368,7 +417,7 @@ export class MyDurableObject {
       if (this.phase === 'running') {
         const msg = String(e?.message || 'stream_failed');
         if ((e && e.name === 'AbortError') || /abort/i.test(msg)) {
-          // Stopped elsewhere; just exit
+          // Stopped intentionally
           return;
         }
         return this.fail(msg);
