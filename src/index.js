@@ -53,6 +53,33 @@ export default {
   }
 }
 
+/**
+ * Durable Object with provider-aware routing (OpenRouter or OpenAI).
+ *
+ * The WebSocket "begin" message should include:
+ * - provider: "openrouter" | "openai" (defaults to "openrouter" if missing/invalid)
+ * - apiKey: string
+ * - or_body: the chat completions body built by the client (model, messages, stream, sampling)
+ *   (for backward compatibility, we also accept "body" or { model, messages } combo)
+ *
+ * Parameter handling:
+ * - Shared and passed to BOTH OpenRouter and OpenAI:
+ *   - temperature
+ *   - top_p
+ *   - frequency_penalty
+ *   - presence_penalty
+ *   - max_tokens
+ *   - reasoning.effort (if present)
+ *   - verbosity (if present)
+ *
+ * - OpenRouter-only (removed for OpenAI, passed through for OpenRouter):
+ *   - top_k
+ *   - repetition_penalty
+ *   - min_p
+ *   - top_a
+ *
+ * Anything else provided by the client is passed through unchanged for OpenRouter.
+ */
 export class MyDurableObject {
   constructor(state, env) {
     this.state = state;
@@ -64,6 +91,7 @@ export class MyDurableObject {
 
   reset() {
     this.rid = null;
+    this.provider = 'openrouter'; // default unless begin specifies openai
     this.buffer = [];        // [{ seq, text }]
     this.seq = -1;
     this.phase = 'idle';     // 'idle' | 'running' | 'done' | 'error'
@@ -108,6 +136,7 @@ export class MyDurableObject {
       return;
     }
     this.rid = snap.rid || null;
+    this.provider = snap.provider || 'openrouter';
     this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
     this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
     this.phase = snap.phase || 'done';
@@ -118,6 +147,7 @@ export class MyDurableObject {
   saveSnapshot() {
     const data = {
       rid: this.rid,
+      provider: this.provider,
       buffer: this.buffer,
       seq: this.seq,
       phase: this.phase,
@@ -214,6 +244,7 @@ export class MyDurableObject {
       const text = (this.buffer.map(it => it.text).join('') + (this.pending || ''));
       const payload = {
         rid: this.rid,
+        provider: this.provider,
         seq: this.seq,
         phase: this.phase,
         done: this.phase === 'done',
@@ -224,6 +255,56 @@ export class MyDurableObject {
     }
 
     return this.corsJSON({ error: 'not allowed' }, 405);
+  }
+
+  normalizeProvider(p) {
+    const v = String(p || '').toLowerCase();
+    return v === 'openai' ? 'openai' : 'openrouter';
+  }
+
+  /**
+   * Sanitize/shape the body for the selected provider.
+   * - Always enforces stream: true
+   * - OpenAI: strips params it doesn't accept (top_k, repetition_penalty, min_p, top_a)
+   */
+  sanitizeBodyForProvider(provider, input) {
+    const body = { ...(input || {}) };
+
+    // Ensure stream is on
+    body.stream = true;
+
+    if (provider === 'openai') {
+      // Remove OpenRouter-only sampling params not accepted by OpenAI Chat Completions:
+      //   - top_k
+      //   - repetition_penalty
+      //   - min_p
+      //   - top_a
+      delete body.top_k;
+      delete body.repetition_penalty;
+      delete body.min_p;
+      delete body.top_a;
+
+      // Allowed/passed-through to OpenAI (from what we use):
+      // - model
+      // - messages
+      // - stream
+      // - temperature
+      // - top_p
+      // - frequency_penalty
+      // - presence_penalty
+      // - max_tokens
+      // - reasoning: { effort }  (OAI accepts effort)
+      // - verbosity              (OAI accepts)
+      //
+      // We leave other common fields alone if present (tools, tool_choice, stop, etc.).
+    } else {
+      // provider === 'openrouter'
+      // Pass-through all parameters — OpenRouter supports the extended set:
+      // - temperature, top_p, top_k, frequency_penalty, presence_penalty,
+      //   repetition_penalty, min_p, top_a, max_tokens, reasoning.effort, verbosity, etc.
+    }
+
+    return body;
   }
 
   async onMessage(ws, evt) {
@@ -249,10 +330,22 @@ export class MyDurableObject {
 
     if (m.type !== 'begin') return this.send(ws, { type: 'err', message: 'bad_type' });
 
-    const { rid, apiKey, or_body, model, messages, after } = m;
-    const body = or_body || (model && Array.isArray(messages) ? { model, messages, stream: true } : null);
+    const {
+      rid,
+      apiKey,
+      provider: provRaw,
+      or_body,              // frontend sends 'or_body'
+      body,                 // also accept 'body' if present
+      model,
+      messages,
+      after
+    } = m;
 
-    if (!rid || !apiKey || !body || !Array.isArray(body.messages) || body.messages.length === 0) {
+    const provider = this.normalizeProvider(provRaw);
+    // Accept or_body, or generic body, or last-resort fallback { model, messages }
+    const rawBody = or_body || body || (model && Array.isArray(messages) ? { model, messages, stream: true } : null);
+
+    if (!rid || !apiKey || !rawBody || !Array.isArray(rawBody.messages) || rawBody.messages.length === 0) {
       return this.send(ws, { type: 'err', message: 'missing_fields' });
     }
 
@@ -268,17 +361,19 @@ export class MyDurableObject {
     // New run
     this.reset();
     this.rid = rid;
+    this.provider = provider;
     this.phase = 'running';
     this.controller = new AbortController();
     this.saveSnapshot();
 
-    this.stream({ apiKey, body }).catch(e => this.fail(String(e?.message || 'stream_failed')));
+    const cleanBody = this.sanitizeBodyForProvider(provider, rawBody);
+    this.stream({ provider, apiKey, body: cleanBody }).catch(e => this.fail(String(e?.message || 'stream_failed')));
   }
 
-  async stream({ apiKey, body }) {
+  async stream({ provider, apiKey, body }) {
     const client = new OpenAI({
       apiKey,
-      baseURL: 'https://openrouter.ai/api/v1',
+      baseURL: provider === 'openai' ? 'https://api.openai.com/v1' : 'https://openrouter.ai/api/v1',
     });
 
     let finishReason = null;
@@ -357,3 +452,4 @@ export class MyDurableObject {
     this.bcast({ type: 'err', message: this.error });
   }
 }
+``` [end:stop]
