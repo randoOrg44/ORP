@@ -1,4 +1,5 @@
 // src/index.js
+import OpenAI from 'openai';
 
 // How long a saved run snapshot is considered fresh (for cold restore)
 const TTL_MS = 20 * 60 * 1000;
@@ -38,14 +39,11 @@ export default {
       const stub = env.MY_DURABLE_OBJECT.get(id);
 
       // Forward both websocket upgrades and HTTP GET to the DO.
-      // - WebSocket: stream as before
-      // - GET: returns aggregated transcript with CORS
       if (req.headers.get('Upgrade') === 'websocket') {
         return stub.fetch(req);
       }
       if (method === 'GET') {
         const r = await stub.fetch(req);
-        // DO already adds CORS; still wrap to ensure CORS is present
         return withCORS(r);
       }
       return withCORS(new Response('method not allowed', { status: 405 }));
@@ -141,10 +139,6 @@ export class MyDurableObject {
     for (const it of this.buffer) {
       if (it.seq > after) this.send(ws, { type: 'delta', seq: it.seq, text: it.text });
     }
-    if (this.phase === 'running' && this.pending) {
-      // We do NOT replay pending for resume to reduce duplication;
-      // the GET endpoint returns the full aggregate if needed.
-    }
     if (this.phase === 'done') this.send(ws, { type: 'done' });
     if (this.phase === 'error') this.send(ws, { type: 'err', message: this.error });
   }
@@ -165,7 +159,6 @@ export class MyDurableObject {
       this.lastFlushedAt = Date.now();
     }
 
-    // Only snapshot occasionally while running; always on terminal states
     if (force) {
       this.saveSnapshot();
     } else {
@@ -177,16 +170,20 @@ export class MyDurableObject {
     if (!text) return;
     this.pending += text;
 
-    // Force flush if pending is big
     if (this.pending.length >= BATCH_BYTES) {
       this.flush(false);
       return;
     }
 
-    // Schedule flush if not already scheduled
     if (!this.flushTimer) {
       this.flushTimer = setTimeout(() => this.flush(false), BATCH_MS);
     }
+  }
+
+  // Append an end reason to the last chat (always as a delta at the end)
+  appendEndReason(reason) {
+    const clean = String(reason || 'unknown').replace(/\s+/g, ' ').trim().slice(0, 128);
+    this.queueDelta(` [end:${clean}]`);
   }
 
   async fetch(req) {
@@ -279,91 +276,60 @@ export class MyDurableObject {
   }
 
   async stream({ apiKey, body }) {
-    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + apiKey
-      },
-      body: JSON.stringify(body),
-      signal: this.controller.signal
-    }).catch(e => ({
-      ok: false,
-      status: 0,
-      body: null,
-      text: async () => String(e?.message || 'fetch_failed')
-    }));
+    const client = new OpenAI({
+      apiKey,
+      baseURL: 'https://openrouter.ai/api/v1',
+    });
 
-    if (!res.ok || !res.body) {
-      const t = await res.text().catch(() => "");
-      return this.fail(t || ('HTTP ' + res.status));
-    }
+    let finishReason = null;
 
-    const dec = new TextDecoder();
-    const reader = res.body.getReader();
-    let buf = '';
-    let sawDone = false;
+    try {
+      const params = { ...body, stream: true };
+      const stream = await client.chat.completions.create(params, { signal: this.controller.signal });
 
-    while (this.phase === 'running') {
-      const { value, done } = await reader.read().catch(() => ({ done: true }));
-      if (done) break;
-
-      buf += dec.decode(value, { stream: true });
-      let i;
-      while ((i = buf.indexOf('\n\n')) !== -1) {
-        const chunk = buf.slice(0, i).trim();
-        buf = buf.slice(i + 2);
-        if (!chunk || !chunk.startsWith('data:')) continue;
-        const data = chunk.slice(5).trim();
-        if (data === '[DONE]') {
-          sawDone = true;
+      for await (const chunk of stream) {
+        if (this.phase !== 'running') {
+          // likely stopped elsewhere; just break
           break;
         }
-        try {
-          const j = JSON.parse(data);
-          const delta = j?.choices?.[0]?.delta?.content ?? '';
-          if (delta) this.queueDelta(delta);
-          if (j?.choices?.[0]?.finish_reason) {
-            sawDone = true;
-            break;
-          }
-        } catch {}
+        const delta = chunk?.choices?.[0]?.delta?.content ?? '';
+        if (delta) this.queueDelta(delta);
+        const fr = chunk?.choices?.[0]?.finish_reason;
+        if (fr) finishReason = fr;
       }
-      if (sawDone) break;
+    } catch (e) {
+      // If aborted due to stop(), do nothing here; stop() handles appending reason and finishing.
+      if (this.phase === 'running') {
+        const msg = String(e?.message || 'stream_failed');
+        if ((e && e.name === 'AbortError') || /abort/i.test(msg)) {
+          // stop() will append reason and finalize
+          return;
+        }
+        return this.fail(msg);
+      }
+      return;
     }
 
-    const tail = buf.trim();
-    if (!sawDone && tail.startsWith('data:')) {
-      const data = tail.slice(5).trim();
-      if (data !== '[DONE]') {
-        try {
-          const j = JSON.parse(data);
-          const delta = j?.choices?.[0]?.delta?.content ?? '';
-          if (delta) this.queueDelta(delta);
-          if (j?.choices?.[0]?.finish_reason) sawDone = true;
-        } catch {}
-      } else {
-        sawDone = true;
-      }
+    // Normal finish via streaming end
+    if (this.phase === 'running') {
+      this.finish(finishReason || 'done');
     }
-
-    // Flush any pending chunks and finish the run
-    this.flush(true);
-    this.finish();
   }
 
-  finish() {
+  finish(reason = 'done') {
     if (this.phase !== 'running') return;
+    this.appendEndReason(reason);
+    this.flush(true);
     this.phase = 'done';
     try { this.controller?.abort(); } catch {}
-    // Snapshot one last time on terminal state
     this.saveSnapshot();
     this.bcast({ type: 'done' });
   }
 
-  stop() {
+  stop(origin = 'client') {
     if (this.phase !== 'running') return;
-    // Flush any pending text before stopping to not lose it
+    // Append reason and finalize
+    this.appendEndReason(`stop:${origin}`);
     this.flush(true);
     this.phase = 'done';
     try { this.controller?.abort(); } catch {}
@@ -373,12 +339,21 @@ export class MyDurableObject {
 
   fail(message) {
     if (this.phase === 'error') return;
-    // Flush anything pending so the aggregated GET includes it
-    this.flush(true);
+    const reason = `error:${String(message || 'unknown')}`.replace(/\s+/g, ' ').trim().slice(0, 200);
+
+    if (this.phase === 'running') {
+      // Append reason to the last chat if stream was active
+      this.appendEndReason(reason);
+      this.flush(true);
+    } else {
+      // Ensure any pending is flushed so GET shows current text
+      this.flush(true);
+    }
+
     this.phase = 'error';
-    this.error = message;
+    this.error = String(message || 'stream_failed');
     try { this.controller?.abort(); } catch {}
     this.saveSnapshot();
-    this.bcast({ type: 'err', message });
+    this.bcast({ type: 'err', message: this.error });
   }
 }
