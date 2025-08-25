@@ -1,13 +1,17 @@
 {
-	"name": "durable-object-starter",
-	"version": "0.0.0",
-	"private": true,
-	"scripts": {
-		"deploy": "wrangler deploy",
-		"dev": "wrangler dev",
-		"start": "wrangler dev"
-	},
-	"devDependencies": {
-		"wrangler": "^4.32.0"
-	}
+  "name": "durable-object-starter",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev"
+  },
+  "dependencies": {
+    "openai": "^5.15.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.32.0"
+  }
 }
