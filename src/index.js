@@ -287,22 +287,39 @@ export class MyDurableObject {
   }
 
   async stream({ apiKey, body, route }) {
-  const useOpenRouter = String(route || this.defaultRoute || 'openrouter').toLowerCase() !== 'openai';
+    // Choose routing
+    const useOpenRouter = String(route || this.defaultRoute || 'openrouter').toLowerCase() !== 'openai';
 
-  const client = new OpenAI({
-    apiKey,
-    baseURL: useOpenRouter ? 'https://openrouter.ai/api/v1' : undefined,
-  });
+    const client = new OpenAI({
+      apiKey,
+      // When using OpenRouter, set baseURL; otherwise default to OpenAI's API
+      baseURL: useOpenRouter ? 'https://openrouter.ai/api/v1' : undefined,
+    });
 
-  let finishReason = null;
+    // Optional: add extra headers for OpenRouter (uncomment if desired)
+    // const extraHeaders = useOpenRouter ? {
+    //   'HTTP-Referer': this.env?.SITE_URL || '',
+    //   'X-Title': this.env?.APP_TITLE || 'ORP',
+    // } : {};
 
-  try {
-    if (useOpenRouter) {
-      // OpenRouter: Chat Completions stream
+    let finishReason = null;
+
+    try {
       const params = { ...body, stream: true };
-      const stream = await client.chat.completions.create(params, {
-        signal: this.controller.signal,
-      });
+
+      // IMPORTANT:
+      // If using OpenAI, do NOT pass a second options argument.
+      // If using OpenRouter, it is fine to pass options (e.g., signal).
+      let stream;
+      if (useOpenRouter) {
+        stream = await client.chat.completions.create(params, {
+          signal: this.controller.signal,
+          // headers: extraHeaders, // optional
+        });
+      } else {
+        // OpenAI path: no params object as second arg
+        stream = await client.chat.completions.create(params);
+      }
 
       for await (const chunk of stream) {
         if (this.phase !== 'running') break;
@@ -311,47 +328,16 @@ export class MyDurableObject {
         const fr = chunk?.choices?.[0]?.finish_reason;
         if (fr) finishReason = fr;
       }
-    } else {
-      // OpenAI: Responses API stream (no extra params/options passed)
-      const { model, messages, input } = body || {};
-      const respParams =
-        messages && Array.isArray(messages)
-          ? { model, messages, stream: true }
-          : { model, input: input ?? (messages ?? ''), stream: true };
-
-      const stream = await client.responses.create(respParams);
-
-      for await (const event of stream) {
-        if (this.phase !== 'running') break;
-
-        // Text deltas
-        if (event.type === 'response.output_text.delta' && event.delta) {
-          this.queueDelta(event.delta);
+    } catch (e) {
+      if (this.phase === 'running') {
+        const msg = String(e?.message || 'stream_failed');
+        if ((e && e.name === 'AbortError') || /abort/i.test(msg)) {
+          return;
         }
-
-        // Tool or other events are ignored by this router
-        if (event.type === 'response.completed') {
-          finishReason = 'done';
-        }
-
-        if (event.type === 'response.error') {
-          throw new Error(event.error?.message || 'openai_stream_error');
-        }
+        return this.fail(msg);
       }
+      return;
     }
-  } catch (e) {
-    if (this.phase === 'running') {
-      const msg = String(e?.message || 'stream_failed');
-      if ((e && e.name === 'AbortError') || /abort/i.test(msg)) return;
-      return this.fail(msg);
-    }
-    return;
-  }
-
-  if (this.phase === 'running') {
-    this.finish(finishReason || 'done');
-  }
-}
 
     // Normal finish via streaming end
     if (this.phase === 'running') {
@@ -385,11 +371,9 @@ export class MyDurableObject {
     const reason = `error:${String(message || 'unknown')}`.replace(/\s+/g, ' ').trim().slice(0, 200);
 
     if (this.phase === 'running') {
-      // Append reason to the last chat if stream was active
       this.appendEndReason(reason);
       this.flush(true);
     } else {
-      // Ensure any pending is flushed so GET shows current text
       this.flush(true);
     }
 
