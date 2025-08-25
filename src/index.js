@@ -452,4 +452,3 @@ export class MyDurableObject {
     this.bcast({ type: 'err', message: this.error });
   }
 }
-``` [end:stop]
