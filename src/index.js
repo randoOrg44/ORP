@@ -1,10 +1,6 @@
 // src/index.js
 import OpenAI from 'openai';
 
-// Default routing: 'openrouter' | 'openai'
-// You can override this in your Cloudflare Worker env with DEFAULT_ROUTE.
-const DEFAULT_ROUTE = 'openai';
-
 // How long a saved run snapshot is considered fresh (for cold restore)
 const TTL_MS = 20 * 60 * 1000;
 
@@ -64,9 +60,6 @@ export class MyDurableObject {
 
     this.sockets = new Set();
     this.reset();
-
-    // Routing default: env override -> code default
-    this.defaultRoute = String(env?.DEFAULT_ROUTE || DEFAULT_ROUTE).toLowerCase() === 'openai' ? 'openai' : 'openrouter';
   }
 
   reset() {
@@ -259,10 +252,6 @@ export class MyDurableObject {
     const { rid, apiKey, or_body, model, messages, after } = m;
     const body = or_body || (model && Array.isArray(messages) ? { model, messages, stream: true } : null);
 
-    // Route/provider selection: 'openrouter' (default) or 'openai'
-    const routeRaw = (m.route || m.provider || this.defaultRoute || 'openrouter');
-    const route = String(routeRaw).toLowerCase() === 'openai' ? 'openai' : 'openrouter';
-
     if (!rid || !apiKey || !body || !Array.isArray(body.messages) || body.messages.length === 0) {
       return this.send(ws, { type: 'err', message: 'missing_fields' });
     }
@@ -283,61 +272,49 @@ export class MyDurableObject {
     this.controller = new AbortController();
     this.saveSnapshot();
 
-    this.stream({ apiKey, body, route }).catch(e => this.fail(String(e?.message || 'stream_failed')));
+    this.stream({ apiKey, body }).catch(e => this.fail(String(e?.message || 'stream_failed')));
   }
-async stream({ apiKey, body, route }) {
-  const useOpenRouter = String(route || this.defaultRoute || 'openrouter').toLowerCase() !== 'openai';
 
-  const client = new OpenAI({
-    apiKey,
-    baseURL: useOpenRouter ? 'https://openrouter.ai/api/v1' : undefined,
-  });
+  async stream({ apiKey, body }) {
+    const client = new OpenAI({
+      apiKey,
+      baseURL: 'https://openrouter.ai/api/v1',
+    });
 
-  let finishReason = null;
+    let finishReason = null;
 
-  try {
-    let params;
-    if (useOpenRouter) {
-      // OpenRouter can take the full body (top_k, etc.)
-      params = { ...body, stream: true };
-    } else {
-      // OpenAI: only keep essentials
-      params = {
-        model: body.model,
-        messages: body.messages,
-        stream: true,
-      };
+    try {
+      const params = { ...body, stream: true };
+      const stream = await client.chat.completions.create(params, { signal: this.controller.signal });
+
+      for await (const chunk of stream) {
+        if (this.phase !== 'running') {
+          // likely stopped elsewhere; just break
+          break;
+        }
+        const delta = chunk?.choices?.[0]?.delta?.content ?? '';
+        if (delta) this.queueDelta(delta);
+        const fr = chunk?.choices?.[0]?.finish_reason;
+        if (fr) finishReason = fr;
+      }
+    } catch (e) {
+      // If aborted due to stop(), do nothing here; stop() handles appending reason and finishing.
+      if (this.phase === 'running') {
+        const msg = String(e?.message || 'stream_failed');
+        if ((e && e.name === 'AbortError') || /abort/i.test(msg)) {
+          // stop() will append reason and finalize
+          return;
+        }
+        return this.fail(msg);
+      }
+      return;
     }
 
-    let stream;
-    if (useOpenRouter) {
-      stream = await client.chat.completions.create(params, {
-        signal: this.controller.signal,
-      });
-    } else {
-      stream = await client.chat.completions.create(params);
-    }
-
-    for await (const chunk of stream) {
-      if (this.phase !== 'running') break;
-      const delta = chunk?.choices?.[0]?.delta?.content ?? '';
-      if (delta) this.queueDelta(delta);
-      const fr = chunk?.choices?.[0]?.finish_reason;
-      if (fr) finishReason = fr;
-    }
-  } catch (e) {
+    // Normal finish via streaming end
     if (this.phase === 'running') {
-      const msg = String(e?.message || 'stream_failed');
-      if ((e && e.name === 'AbortError') || /abort/i.test(msg)) return;
-      return this.fail(msg);
+      this.finish(finishReason || 'done');
     }
-    return;
   }
-
-  if (this.phase === 'running') {
-    this.finish(finishReason || 'done');
-  }
-}
 
   finish(reason = 'done') {
     if (this.phase !== 'running') return;
@@ -365,9 +342,11 @@ async stream({ apiKey, body, route }) {
     const reason = `error:${String(message || 'unknown')}`.replace(/\s+/g, ' ').trim().slice(0, 200);
 
     if (this.phase === 'running') {
+      // Append reason to the last chat if stream was active
       this.appendEndReason(reason);
       this.flush(true);
     } else {
+      // Ensure any pending is flushed so GET shows current text
       this.flush(true);
     }
 
