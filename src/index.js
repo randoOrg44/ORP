@@ -273,7 +273,6 @@ export class MyDurableObject {
     this.rid = rid;
     this.phase = 'running';
     this.controller = new AbortController();
-    // No snapshot here; we'll snapshot occasionally and at terminal states.
     this.saveSnapshot();
 
     this.stream({ apiKey, body }).catch(e => this.fail(String(e?.message || 'stream_failed')));
