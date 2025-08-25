@@ -1,10 +1,13 @@
 // src/index.js
 import OpenAI from 'openai';
 
+// How long a saved run snapshot is considered fresh (for cold restore)
 const TTL_MS = 20 * 60 * 1000;
-const BATCH_MS = 60;
-const BATCH_BYTES = 2048;
-const SNAPSHOT_MIN_MS = 1500;
+
+// Batching/Throttling
+const BATCH_MS = 60;            // how often to flush accumulated deltas (ms)
+const BATCH_BYTES = 2048;       // force flush if pending exceeds this many bytes
+const SNAPSHOT_MIN_MS = 1500;   // minimum spacing between snapshots (ms)
 
 const corsHeaders = () => ({
   'Access-Control-Allow-Origin': '*',
@@ -23,14 +26,19 @@ export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     const method = req.method.toUpperCase();
+
+    // CORS preflight support
     if (method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
+
     if (url.pathname === '/ws') {
       const raw = url.searchParams.get('uid') || 'anon';
       const uid = String(raw).slice(0, 64).replace(/[^a-zA-Z0-9_-]/g, '') || 'anon';
       const id = env.MY_DURABLE_OBJECT.idFromName(uid);
       const stub = env.MY_DURABLE_OBJECT.get(id);
+
+      // Forward both websocket upgrades and HTTP GET to the DO.
       if (req.headers.get('Upgrade') === 'websocket') {
         return stub.fetch(req);
       }
@@ -40,6 +48,7 @@ export default {
       }
       return withCORS(new Response('method not allowed', { status: 405 }));
     }
+
     return withCORS(new Response('not found', { status: 404 }));
   }
 }
@@ -48,19 +57,21 @@ export class MyDurableObject {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+
     this.sockets = new Set();
     this.reset();
   }
 
   reset() {
     this.rid = null;
-    this.provider = 'openrouter';
-    this.buffer = [];
+    this.buffer = [];        // [{ seq, text }]
     this.seq = -1;
-    this.phase = 'idle';
+    this.phase = 'idle';     // 'idle' | 'running' | 'done' | 'error'
     this.error = null;
     this.controller = null;
-    this.pending = '';
+
+    // Batching/throttling
+    this.pending = '';        // text waiting to be flushed/broadcasted
     this.flushTimer = null;
     this.lastSavedAt = 0;
     this.lastFlushedAt = 0;
@@ -97,18 +108,16 @@ export class MyDurableObject {
       return;
     }
     this.rid = snap.rid || null;
-    this.provider = snap.provider || 'openrouter';
     this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
     this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
     this.phase = snap.phase || 'done';
     this.error = snap.error || null;
-    this.pending = '';
+    this.pending = ''; // pending is never persisted
   }
 
   saveSnapshot() {
     const data = {
       rid: this.rid,
-      provider: this.provider,
       buffer: this.buffer,
       seq: this.seq,
       phase: this.phase,
@@ -139,6 +148,7 @@ export class MyDurableObject {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+
     if (this.pending) {
       const text = this.pending;
       this.pending = '';
@@ -148,6 +158,7 @@ export class MyDurableObject {
       this.bcast({ type: 'delta', seq, text });
       this.lastFlushedAt = Date.now();
     }
+
     if (force) {
       this.saveSnapshot();
     } else {
@@ -158,41 +169,51 @@ export class MyDurableObject {
   queueDelta(text) {
     if (!text) return;
     this.pending += text;
+
     if (this.pending.length >= BATCH_BYTES) {
       this.flush(false);
       return;
     }
+
     if (!this.flushTimer) {
       this.flushTimer = setTimeout(() => this.flush(false), BATCH_MS);
     }
   }
 
+  // Append an end reason to the last chat (always as a delta at the end)
   appendEndReason(reason) {
     const clean = String(reason || 'unknown').replace(/\s+/g, ' ').trim().slice(0, 128);
-    this.queueDelta(`[end:${clean}]`);
+    this.queueDelta(` [end:${clean}]`);
   }
 
   async fetch(req) {
     const url = new URL(req.url);
     const upgrade = req.headers.get('Upgrade');
+
+    // CORS preflight
     if (req.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
+
+    // WebSocket path
     if (url.pathname === '/ws' && upgrade === 'websocket') {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       server.accept();
+
       this.sockets.add(server);
       server.addEventListener('close', () => this.sockets.delete(server));
       server.addEventListener('message', (e) => this.onMessage(server, e));
+
       return new Response(null, { status: 101, webSocket: client });
     }
+
+    // HTTP GET: aggregated transcript for this DO (uid)
     if (req.method === 'GET') {
       await this.restoreIfCold();
       const text = (this.buffer.map(it => it.text).join('') + (this.pending || ''));
       const payload = {
         rid: this.rid,
-        provider: this.provider,
         seq: this.seq,
         phase: this.phase,
         done: this.phase === 'done',
@@ -201,191 +222,97 @@ export class MyDurableObject {
       };
       return this.corsJSON(payload, 200);
     }
+
     return this.corsJSON({ error: 'not allowed' }, 405);
-  }
-
-  normalizeProvider(p) {
-    const v = String(p || '').toLowerCase();
-    return v === 'openai' ? 'openai' : 'openrouter';
-  }
-
-  mapParts(provider, parts) {
-    if (!Array.isArray(parts)) {
-      const t = String(parts ?? '');
-      return provider === 'openai'
-        ? [{ type: 'input_text', text: t }]
-        : [{ type: 'text', text: t }];
-    }
-    if (provider !== 'openai') {
-      return parts;
-    }
-    const out = [];
-    for (const p of parts) {
-      if (!p || typeof p !== 'object') continue;
-      if (p.type === 'text' && typeof p.text === 'string') {
-        out.push({ type: 'input_text', text: p.text });
-      } else if (p.type === 'input_text' && typeof p.text === 'string') {
-        out.push({ type: 'input_text', text: p.text });
-      } else if (p.type === 'image_url') {
-        const url = typeof p.image_url === 'string' ? p.image_url : (p.image_url && p.image_url.url);
-        if (url) out.push({ type: 'input_image', image_url: url });
-      } else if (p.type === 'input_image' && p.image_url) {
-        const url = typeof p.image_url === 'string' ? p.image_url : (p.image_url && p.image_url.url);
-        if (url) out.push({ type: 'input_image', image_url: url });
-      } else if (p.type === 'input_audio' && p.input_audio && p.input_audio.data && p.input_audio.format) {
-        out.push({ type: 'input_audio', data: p.input_audio.data, format: p.input_audio.format });
-      } else if (p.type === 'file') {
-        const name = p.file?.filename || 'file';
-        out.push({ type: 'input_text', text: `(file attached: ${name})` });
-      } else if (p.type === 'output_text' && typeof p.text === 'string') {
-        out.push({ type: 'input_text', text: p.text });
-      } else if (typeof p === 'string') {
-        out.push({ type: 'input_text', text: p });
-      } else if (p.text) {
-        out.push({ type: 'input_text', text: String(p.text) });
-      }
-    }
-    if (!out.length) out.push({ type: 'input_text', text: '' });
-    return out;
-  }
-
-  sanitizeBodyForProvider(provider, input) {
-    const body = { ...(input || {}) };
-    if (!body.input) {
-      if (Array.isArray(body.messages)) {
-        body.input = body.messages.map(m => ({
-          role: m.role || 'user',
-          content: this.mapParts(provider, m.content ?? (m.text != null ? String(m.text) : ''))
-        }));
-        delete body.messages;
-      } else if (typeof body.prompt === 'string') {
-        body.input = [{ role: 'user', content: this.mapParts(provider, [{ type: 'text', text: body.prompt }]) }];
-        delete body.prompt;
-      }
-    } else if (Array.isArray(body.input)) {
-      body.input = body.input.map(msg => ({
-        role: msg.role || 'user',
-        content: this.mapParts(provider, msg.content)
-      }));
-    }
-    body.stream = true;
-    if (body.max_tokens != null && body.max_output_tokens == null) {
-      body.max_output_tokens = body.max_tokens;
-      delete body.max_tokens;
-    }
-    if (provider === 'openai') {
-      delete body.top_k;
-      delete body.repetition_penalty;
-      delete body.min_p;
-      delete body.top_a;
-      delete body.frequency_penalty;
-      delete body.presence_penalty;
-      if (!Array.isArray(body.input)) {
-        body.input = [{ role: 'user', content: [{ type: 'input_text', text: '' }] }];
-      } else {
-        body.input = body.input.map(msg => ({
-          role: msg.role || 'user',
-          content: this.mapParts('openai', msg.content)
-        }));
-      }
-    }
-    return body;
   }
 
   async onMessage(ws, evt) {
     await this.restoreIfCold();
+
     let m;
     try {
       m = JSON.parse(String(evt.data || ''));
     } catch {
       return this.send(ws, { type: 'err', message: 'bad_json' });
     }
+
     if (m.type === 'resume') {
       if (!m.rid || m.rid !== this.rid) return this.send(ws, { type: 'err', message: 'stale_run' });
       const after = Number.isFinite(+m.after) ? +m.after : -1;
       return this.replay(ws, after);
     }
+
     if (m.type === 'stop') {
       if (m.rid && m.rid === this.rid) this.stop('client');
       return;
     }
+
     if (m.type !== 'begin') return this.send(ws, { type: 'err', message: 'bad_type' });
-    const {
-      rid,
-      apiKey,
-      provider: provRaw,
-      or_body,
-      body,
-      model,
-      messages,
-      after
-    } = m;
-    const provider = this.normalizeProvider(provRaw);
-    let rawBody = or_body || body || null;
-    if (!rawBody && model && Array.isArray(messages)) {
-      rawBody = { model, messages, stream: true };
-    }
-    const hasMessages = rawBody && Array.isArray(rawBody.messages) && rawBody.messages.length > 0;
-    const hasInput = rawBody && (rawBody.input || rawBody.prompt);
-    const hasModel = rawBody && rawBody.model;
-    if (!rid || !apiKey || !rawBody || !hasModel || (!hasMessages && !hasInput)) {
+
+    const { rid, apiKey, or_body, model, messages, after } = m;
+    const body = or_body || (model && Array.isArray(messages) ? { model, messages, stream: true } : null);
+
+    if (!rid || !apiKey || !body || !Array.isArray(body.messages) || body.messages.length === 0) {
       return this.send(ws, { type: 'err', message: 'missing_fields' });
     }
+
     if (this.phase === 'running' && rid !== this.rid) {
       return this.send(ws, { type: 'err', message: 'busy' });
     }
+
     if (rid === this.rid && this.phase !== 'idle') {
       const a = Number.isFinite(+after) ? +after : -1;
       return this.replay(ws, a);
     }
+
+    // New run
     this.reset();
     this.rid = rid;
-    this.provider = provider;
     this.phase = 'running';
     this.controller = new AbortController();
     this.saveSnapshot();
-    const cleanBody = this.sanitizeBodyForProvider(provider, rawBody);
-    this.stream({ provider, apiKey, body: cleanBody }).catch(e => this.fail(String(e?.message || 'stream_failed')));
+
+    this.stream({ apiKey, body }).catch(e => this.fail(String(e?.message || 'stream_failed')));
   }
 
-  async stream({ provider, apiKey, body }) {
+  async stream({ apiKey, body }) {
     const client = new OpenAI({
       apiKey,
-      baseURL: provider === 'openai' ? 'https://api.openai.com/v1' : 'https://openrouter.ai/api/v1',
+      baseURL: 'https://openrouter.ai/api/v1',
     });
+
+    let finishReason = null;
+
     try {
-      const stream = await client.responses.stream({ ...body }, { signal: this.controller.signal });
-      for await (const event of stream) {
-        if (this.phase !== 'running') break;
-        if (event.type === 'response.output_text.delta') {
-          const delta = event.delta || '';
-          if (delta) this.queueDelta(delta);
+      const params = { ...body, stream: true };
+      const stream = await client.chat.completions.create(params, { signal: this.controller.signal });
+
+      for await (const chunk of stream) {
+        if (this.phase !== 'running') {
+          // likely stopped elsewhere; just break
+          break;
         }
-        if (event.type === 'response.message.delta') {
-          const parts = event.delta?.content || [];
-          for (const p of parts) {
-            if (p.type === 'output_text' && p.text) this.queueDelta(p.text);
-          }
-        }
-        if (event.type === 'response.completed') {
-          this.finish('completed');
-        }
-        if (event.type === 'response.error') {
-          const msg = event.error?.message || 'stream_failed';
-          return this.fail(msg);
-        }
-      }
-      if (this.phase === 'running') {
-        this.finish('done');
+        const delta = chunk?.choices?.[0]?.delta?.content ?? '';
+        if (delta) this.queueDelta(delta);
+        const fr = chunk?.choices?.[0]?.finish_reason;
+        if (fr) finishReason = fr;
       }
     } catch (e) {
+      // If aborted due to stop(), do nothing here; stop() handles appending reason and finishing.
       if (this.phase === 'running') {
         const msg = String(e?.message || 'stream_failed');
         if ((e && e.name === 'AbortError') || /abort/i.test(msg)) {
+          // stop() will append reason and finalize
           return;
         }
         return this.fail(msg);
       }
+      return;
+    }
+
+    // Normal finish via streaming end
+    if (this.phase === 'running') {
+      this.finish(finishReason || 'done');
     }
   }
 
@@ -401,6 +328,7 @@ export class MyDurableObject {
 
   stop(origin = 'client') {
     if (this.phase !== 'running') return;
+    // Append reason and finalize
     this.appendEndReason(`stop:${origin}`);
     this.flush(true);
     this.phase = 'done';
@@ -412,12 +340,16 @@ export class MyDurableObject {
   fail(message) {
     if (this.phase === 'error') return;
     const reason = `error:${String(message || 'unknown')}`.replace(/\s+/g, ' ').trim().slice(0, 200);
+
     if (this.phase === 'running') {
+      // Append reason to the last chat if stream was active
       this.appendEndReason(reason);
       this.flush(true);
     } else {
+      // Ensure any pending is flushed so GET shows current text
       this.flush(true);
     }
+
     this.phase = 'error';
     this.error = String(message || 'stream_failed');
     try { this.controller?.abort(); } catch {}
