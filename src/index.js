@@ -302,8 +302,6 @@ export class MyDurableObject {
       // Map sampling controls if present
       temperature: body.temperature,
       top_p: body.top_p,
-      frequency_penalty: body.frequency_penalty,
-      presence_penalty: body.presence_penalty,
       stream: true,
     };
     if (Number.isFinite(+body.max_tokens) && +body.max_tokens > 0) {
