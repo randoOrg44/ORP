@@ -3,7 +3,7 @@
 
 name = "orp"
 main = "src/index.js"
-compatibility_date = "2025-8-0"
+compatibility_date = "2025-08-24"
 
 # Durable Objects
 [[migrations]]
