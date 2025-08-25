@@ -334,7 +334,7 @@ export class MyDurableObject {
       model: body.model,
       input,
       temperature: body.temperature,
-      top_p: body.top_p,
+      //top_p: body.top_p,
       stream: true,
     };
     if (Number.isFinite(+body.max_tokens) && +body.max_tokens > 0) {
