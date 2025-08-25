@@ -303,9 +303,10 @@ export class MyDurableObject {
       delete body.repetition_penalty;
       delete body.min_p;
       delete body.top_a;
-			delete body.frequency_penalty
+	  delete body.frequency_penalty;
+	  delete body.presence_penalty;
       // OpenAI Responses accepts: model, input, temperature, top_p,
-      // presence_penalty, max_output_tokens, reasoning, verbosity, tools, tool_choice, stop, etc.
+      // max_output_tokens, reasoning, verbosity, tools, tool_choice, stop, etc.
     } else {
       // provider === 'openrouter'
       // Pass-through extended sampling params supported by OpenRouter.
