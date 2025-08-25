@@ -54,33 +54,21 @@ export default {
 }
 
 /**
- * Durable Object with provider-aware routing (OpenRouter or OpenAI).
- *
- * The WebSocket "begin" message should include:
- * - provider: "openrouter" | "openai" (defaults to "openrouter" if missing/invalid)
- * - apiKey: string
- * - or_body: legacy chat-style body built by the client ({ model, messages, ... })
- *   (for backward compatibility, we also accept "body" or { model, messages } combo)
- *
- * Parameter handling (Responses API):
- * - Shared and passed to BOTH OpenRouter and OpenAI:
- *   - temperature
- *   - top_p
- *   - frequency_penalty
- *   - presence_penalty
- *   - max_output_tokens  (mapped from max_tokens if present)
- *   - reasoning: { effort, summary? }
- *   - verbosity
- *   - tools, tool_choice, stop, etc. (passed through if present)
- *
- * - OpenRouter-only parameters (removed for OpenAI):
- *   - top_k
- *   - repetition_penalty
- *   - min_p
- *   - top_a
- *
- * Anything else provided by the client is passed through unchanged for OpenRouter.
- */
+Durable Object with provider-aware routing (OpenRouter or OpenAI).
+
+The WebSocket "begin" message should include:
+  provider: "openrouter" | "openai" (defaults to "openrouter" if missing/invalid)
+  apiKey: string
+  or_body: legacy chat-style body built by the client ({ model, messages, ... })
+  (for backward compatibility, we also accept "body" or { model, messages } combo)
+
+Parameter handling (Responses API):
+  Shared passed-through:
+    temperature, top_p, max_output_tokens (from max_tokens), reasoning, verbosity,
+    tools, tool_choice, stop, etc.
+  OpenRouter-only (removed for OpenAI):
+    top_k, repetition_penalty, min_p, top_a
+*/
 export class MyDurableObject {
   constructor(state, env) {
     this.state = state;
@@ -214,7 +202,7 @@ export class MyDurableObject {
   // Append an end reason to the last chat (always as a delta at the end)
   appendEndReason(reason) {
     const clean = String(reason || 'unknown').replace(/\s+/g, ' ').trim().slice(0, 128);
-    this.queueDelta(` [end:${clean}]`);
+    this.queueDelta(`[end:${clean}]`);
   }
 
   async fetch(req) {
@@ -264,11 +252,52 @@ export class MyDurableObject {
   }
 
   /**
+   * Map message content parts to provider-specific schema.
+   * For OpenAI Responses: use input_* types.
+   * For OpenRouter: pass through unchanged.
+   */
+  mapParts(provider, parts) {
+    if (!Array.isArray(parts)) {
+      const t = String(parts ?? '');
+      return provider === 'openai'
+        ? [{ type: 'input_text', text: t }]
+        : [{ type: 'text', text: t }];
+    }
+
+    if (provider !== 'openai') {
+      // OpenRouter accepts legacy types like 'text', 'image_url', etc.
+      return parts;
+    }
+
+    // OpenAI Responses mapping
+    const out = [];
+    for (const p of parts) {
+      if (!p || typeof p !== 'object') continue;
+      if (p.type === 'text' && typeof p.text === 'string') {
+        out.push({ type: 'input_text', text: p.text });
+      } else if (p.type === 'image_url' && p.image_url && p.image_url.url) {
+        out.push({ type: 'input_image', image_url: p.image_url.url });
+      } else if (p.type === 'input_audio' && p.input_audio && p.input_audio.data && p.input_audio.format) {
+        out.push({ type: 'input_audio', data: p.input_audio.data, format: p.input_audio.format });
+      } else if (p.type === 'file') {
+        // OpenAI Responses generally expects file IDs. Downgrade to text note.
+        const name = p.file?.filename || 'file';
+        out.push({ type: 'input_text', text: `(file attached: ${name})` });
+      } else if (p.type === 'output_text' && typeof p.text === 'string') {
+        // Rare inbound case; normalize to input_text.
+        out.push({ type: 'input_text', text: p.text });
+      } else {
+        // Fallback: stringify safely
+        out.push({ type: 'input_text', text: '[unsupported part omitted]' });
+      }
+    }
+    return out;
+  }
+
+  /**
    * Convert an incoming chat-style body into a Responses API request.
-   * - Ensures stream:true
-   * - Converts {messages:[{role,content}]} -> input:[{role,content}]
-   * - Maps max_tokens -> max_output_tokens
-   * - Removes OpenRouter-only params for OpenAI
+   * Ensures stream:true. Converts {messages:[{role,content}]} -> input:[{role,content}]
+   * Maps max_tokens -> max_output_tokens. Removes OpenRouter-only params for OpenAI.
    */
   sanitizeBodyForProvider(provider, input) {
     const body = { ...(input || {}) };
@@ -279,13 +308,19 @@ export class MyDurableObject {
       if (Array.isArray(body.messages)) {
         body.input = body.messages.map(m => ({
           role: m.role,
-          content: m.content
+          content: this.mapParts(provider, m.content ?? [{ type: 'text', text: String(m.text ?? '') }])
         }));
         delete body.messages;
       } else if (typeof body.prompt === 'string') {
-        body.input = [{ role: 'user', content: body.prompt }];
+        body.input = [{ role: 'user', content: this.mapParts(provider, [{ type: 'text', text: body.prompt }]) }];
         delete body.prompt;
       }
+    } else if (Array.isArray(body.input)) {
+      // If input is present but parts might be legacy, normalize per message.
+      body.input = body.input.map(msg => ({
+        role: msg.role,
+        content: this.mapParts(provider, msg.content)
+      }));
     }
 
     // Stream on
@@ -303,14 +338,9 @@ export class MyDurableObject {
       delete body.repetition_penalty;
       delete body.min_p;
       delete body.top_a;
-	  delete body.frequency_penalty;
-	  delete body.presence_penalty;
-      // OpenAI Responses accepts: model, input, temperature, top_p,
-      // max_output_tokens, reasoning, verbosity, tools, tool_choice, stop, etc.
-    } else {
-      // provider === 'openrouter'
-      // Pass-through extended sampling params supported by OpenRouter.
-      // No changes needed.
+      // Frequency/presence penalties have been unstable across endpoints; omit to be safe
+      delete body.frequency_penalty;
+      delete body.presence_penalty;
     }
 
     return body;
@@ -408,7 +438,6 @@ export class MyDurableObject {
 
         // Some providers emit message deltas
         if (event.type === 'response.message.delta') {
-          // event.delta may be structured; prefer text deltas above.
           const parts = event.delta?.content || [];
           for (const p of parts) {
             if (p.type === 'output_text' && p.text) this.queueDelta(p.text);
@@ -417,7 +446,6 @@ export class MyDurableObject {
 
         // Completed
         if (event.type === 'response.completed') {
-          // stream.finalResponse() returns the full response if needed
           this.finish('completed');
         }
 
