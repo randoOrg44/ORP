@@ -1,4 +1,6 @@
 const TTL_MS = 20601000; // ~5.72h
+const FLUSH_MS = 50;     // broadcast cadence
+const SNAPSHOT_MS = 250; // storage write throttle
 
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
@@ -34,10 +36,12 @@ export default {
   async fetch(req, env) {
     const u = new URL(req.url);
 
+    // CORS preflight
     if (req.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
+    // WebSocket streaming: /ws?uid=...
     if (u.pathname === "/ws") {
       const raw = u.searchParams.get("uid") || "anon";
       const uid = String(raw).slice(0, 64).replace(/[^a-zA-Z0-9_-]/g, "") || "anon";
@@ -45,6 +49,7 @@ export default {
       return env.MY_DURABLE_OBJECT.get(id).fetch(req);
     }
 
+    // REST: GET /chat/:uid -> snapshot
     if (u.pathname.startsWith("/chat/") && req.method === "GET") {
       const raw = u.pathname.split("/")[2] || "";
       const uid = String(raw).slice(0, 64).replace(/[^a-zA-Z0-9_-]/g, "") || "anon";
@@ -53,6 +58,7 @@ export default {
       return env.MY_DURABLE_OBJECT.get(id).fetch(r);
     }
 
+    // Shortcut: GET /:uid
     const parts = u.pathname.split("/").filter(Boolean);
     if (req.method === "GET" && parts.length === 1 && parts[0] !== "ws" && parts[0] !== "chat") {
       const raw = parts[0] || "";
@@ -71,6 +77,7 @@ export class MyDurableObject {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+
     this.sockets = new Set();
     this.reset();
   }
@@ -78,24 +85,33 @@ export class MyDurableObject {
   reset() {
     this.rid = null;
     this.buffer = [];       // [{seq, text}]
-    this.full = "";
+    this.full = "";         // aggregated assistant content
     this.seq = -1;
     this.phase = "idle";    // idle | running | done | error
     this.error = null;
     this.controller = null;
-    this.savedAt = 0;
-    this.requestMessages = [];
-    this.lastUpdateAt = 0;
+    this.savedAt = 0;       // last snapshot saved time
+    this.requestMessages = []; // last request body.messages
+    this.lastUpdateAt = 0;  // last delta arrival time
+
+    // batching state
+    this.pendingText = "";      // coalesced deltas awaiting flush
+    this.flushTimer = null;     // timer handle
+    this.flushing = false;      // reentrancy guard
   }
 
+  // Load last snapshot if within TTL when needed
   async restoreIfCold() {
     if (this.rid) return;
+
     const snap = await this.state.storage.get("run").catch(() => null);
     const fresh = snap && Date.now() - (snap.savedAt || 0) < TTL_MS;
+
     if (!fresh) {
       if (snap) await this.state.storage.delete("run").catch(() => {});
       return;
     }
+
     this.rid = snap.rid || null;
     this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
     this.full = typeof snap.full === "string" ? snap.full : (this.buffer.map(b => b.text).join("") || "");
@@ -105,9 +121,15 @@ export class MyDurableObject {
     this.savedAt = Number.isFinite(+snap.savedAt) ? +snap.savedAt : Date.now();
     this.requestMessages = Array.isArray(snap.requestMessages) ? snap.requestMessages : [];
     this.lastUpdateAt = Number.isFinite(+snap.lastUpdateAt) ? +snap.lastUpdateAt : this.savedAt;
+
+    // no need to restore batching queues
+    this.pendingText = "";
   }
 
-  saveSnapshot() {
+  // Throttled snapshot
+  maybeSaveSnapshot(force = false) {
+    const now = Date.now();
+    if (!force && now - this.savedAt < SNAPSHOT_MS) return;
     const data = {
       rid: this.rid,
       buffer: this.buffer,
@@ -117,10 +139,57 @@ export class MyDurableObject {
       error: this.error,
       requestMessages: this.requestMessages,
       lastUpdateAt: this.lastUpdateAt,
-      savedAt: Date.now()
+      savedAt: now
     };
-    this.savedAt = data.savedAt;
+    this.savedAt = now;
+    // Fire-and-forget to avoid blocking the hot path
     this.state.storage.put("run", data).catch(() => {});
+  }
+
+  // Coalesced broadcast and persistence flush
+  async flushNow() {
+    if (this.flushing) return;
+    if (!this.pendingText) return;
+
+    this.flushing = true;
+    const d = this.pendingText;
+    this.pendingText = "";
+
+    try {
+      const seq = ++this.seq;
+      this.buffer.push({ seq, text: d });
+      this.full += d;
+      this.lastUpdateAt = Date.now();
+
+      const msg = JSON.stringify({ type: "delta", seq, text: d });
+      for (const ws of this.sockets) {
+        try { ws.send(msg); } catch {}
+      }
+
+      this.maybeSaveSnapshot(false);
+    } finally {
+      this.flushing = false;
+    }
+  }
+
+  scheduleFlush() {
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.flushNow().catch(() => {});
+      // If more text arrived during flush, schedule another tick
+      if (this.pendingText) this.scheduleFlush();
+    }, FLUSH_MS);
+  }
+
+  // Force a final synchronous flush before terminal events
+  async flushFinal() {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    await this.flushNow();
+    this.maybeSaveSnapshot(true);
   }
 
   bcast(o) {
@@ -145,10 +214,12 @@ export class MyDurableObject {
   async fetch(req) {
     const u = new URL(req.url);
 
+    // HTTP GET snapshot endpoint for Worker to forward to.
     if (req.method === "GET" && u.pathname === "/snapshot" && req.headers.get("Upgrade") !== "websocket") {
       await this.restoreIfCold();
+
       const ttlRemaining = Math.max(0, (this.savedAt || 0) + TTL_MS - Date.now());
-      return json({
+      const body = {
         rid: this.rid,
         phase: this.phase,
         seq: this.seq,
@@ -159,9 +230,12 @@ export class MyDurableObject {
         savedAt: this.savedAt || 0,
         lastUpdateAt: this.lastUpdateAt || 0,
         ttlRemaining
-      });
+      };
+
+      return json(body);
     }
 
+    // WebSocket endpoint for streaming
     if (req.method !== "GET" || req.headers.get("Upgrade") !== "websocket") {
       return text("Expected websocket", 426);
     }
@@ -195,8 +269,11 @@ export class MyDurableObject {
     await this.restoreIfCold();
 
     let m;
-    try { m = JSON.parse(String(evt.data || "")); }
-    catch { return this.send(ws, { type: "err", message: "bad_json" }); }
+    try {
+      m = JSON.parse(String(evt.data || ""));
+    } catch {
+      return this.send(ws, { type: "err", message: "bad_json" });
+    }
 
     if (m.type === "resume") {
       if (!m.rid || m.rid !== this.rid) return this.send(ws, { type: "err", message: "stale_run" });
@@ -235,7 +312,7 @@ export class MyDurableObject {
     this.requestMessages = Array.isArray(body.messages) ? body.messages : [];
     this.full = "";
     this.lastUpdateAt = Date.now();
-    this.saveSnapshot();
+    this.maybeSaveSnapshot(true); // initial snapshot
 
     this.stream({ apiKey, body }).catch((e) => this.fail(String(e?.message || "stream_failed")));
   }
@@ -268,12 +345,10 @@ export class MyDurableObject {
     let doneSignal = false;
 
     const push = (d) => {
-      const seq = ++this.seq;
-      this.buffer.push({ seq, text: d });
-      this.full += d;
+      // Accumulate and defer IO
+      this.pendingText += d;
       this.lastUpdateAt = Date.now();
-      this.bcast({ type: "delta", seq, text: d });
-      this.saveSnapshot();
+      this.scheduleFlush();
     };
 
     try {
@@ -283,8 +358,7 @@ export class MyDurableObject {
 
         buf += dec.decode(value, { stream: true });
 
-        // Process complete lines
-        // Per OpenRouter docs: parse by newline; lines start with "data: " or ":" comments; [DONE] terminates.
+        // Process complete lines (SSE)
         while (true) {
           const idx = buf.indexOf("\n");
           if (idx === -1) break;
@@ -292,20 +366,16 @@ export class MyDurableObject {
           const rawLine = buf.slice(0, idx);
           buf = buf.slice(idx + 1);
 
-          const line = rawLine.trimEnd(); // keep leading spaces for "data: "
+          const line = rawLine.trimEnd();
           if (!line) continue;
-
-          if (line.startsWith(":")) {
-            // SSE comment keep-alive, ignore.
-            continue;
-          }
+          if (line.startsWith(":")) continue; // keep-alive
 
           if (line.startsWith("data:")) {
             const data = line.slice(5).trimStart();
 
             if (data === "[DONE]") {
               doneSignal = true;
-              break; // exit inner; outer will break on next iteration
+              break;
             }
 
             try {
@@ -318,7 +388,7 @@ export class MyDurableObject {
                 break;
               }
             } catch {
-              // ignore partial or non-JSON payloads
+              // ignore partial lines
             }
           }
         }
@@ -329,40 +399,50 @@ export class MyDurableObject {
       try { await reader.cancel(); } catch {}
     }
 
-    // After stream closes, decide terminal state
+    // Finalize pending work before terminal signal
+    await this.flushFinal();
+
     if (doneSignal) {
       this.finish();
     } else {
-      // No explicit [DONE] or finish_reason → treat as incomplete
-      this.fail("stream_incomplete");
+      // If lots of content but no terminal marker, treat as soft-finish instead of error
+      // to avoid false negatives on very long runs that get cut mid-connection.
+      if (this.seq >= 0) {
+        this.finish();
+      } else {
+        this.fail("stream_incomplete");
+      }
     }
   }
 
-  finish() {
+  async finish() {
     if (this.phase !== "running") return;
+    await this.flushFinal();
     this.phase = "done";
     try { this.controller?.abort(); } catch {}
     this.lastUpdateAt = Date.now();
-    this.saveSnapshot();
+    this.maybeSaveSnapshot(true);
     this.bcast({ type: "done" });
   }
 
-  stop() {
+  async stop() {
     if (this.phase !== "running") return;
+    await this.flushFinal();
     this.phase = "done";
     try { this.controller?.abort(); } catch {}
     this.lastUpdateAt = Date.now();
-    this.saveSnapshot();
+    this.maybeSaveSnapshot(true);
     this.bcast({ type: "done" });
   }
 
-  fail(message) {
+  async fail(message) {
     if (this.phase === "error") return;
+    await this.flushFinal();
     this.phase = "error";
     this.error = message;
     try { this.controller?.abort(); } catch {}
     this.lastUpdateAt = Date.now();
-    this.saveSnapshot();
+    this.maybeSaveSnapshot(true);
     this.bcast({ type: "err", message });
   }
 }
