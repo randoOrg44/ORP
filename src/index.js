@@ -284,22 +284,55 @@ export class MyDurableObject {
     await this.streamOpenRouter({ apiKey, body });
   }
 
+  // Map chat-style message parts to OpenAI Responses API input content
+  mapContentPartToResponses(part) {
+    const t = (part && part.type) || 'text';
+
+    if (t === 'text') {
+      // Convert to input_text
+      return { type: 'input_text', text: String(part.text || '') };
+    }
+
+    if (t === 'image_url') {
+      const url = part?.image_url?.url || part?.image_url || '';
+      if (url) return { type: 'input_image', image_url: String(url) };
+      // Fallback to text if no URL
+      return { type: 'input_text', text: '' };
+    }
+
+    // Unsupported inline for Responses without file upload: degrade to text
+    if (t === 'file') {
+      const fname = part?.file?.filename || 'file';
+      return { type: 'input_text', text: `[file:${fname}]` };
+    }
+
+    if (t === 'input_audio') {
+      const fmt = part?.input_audio?.format || 'audio';
+      return { type: 'input_text', text: `[audio:${fmt}]` };
+    }
+
+    // Any unknown -> input_text fallback
+    return { type: 'input_text', text: '' };
+  }
+
   // New: Direct OpenAI Responses API streaming path
   async streamOpenAI({ apiKey, body }) {
     const client = new OpenAI({ apiKey });
 
-    // Translate chat.completions-style body to Responses API
-    const input = Array.isArray(body.messages) ? body.messages.map(m => ({
-      role: m.role,
-      // Pass through content as-is (array of {type, text, ...}) is supported in Responses
-      content: m.content
-    })) : [];
+    // Translate chat.completions-style body to Responses API (roles + content[])
+    const input = Array.isArray(body.messages)
+      ? body.messages.map(m => ({
+          role: m.role,
+          content: Array.isArray(m.content)
+            ? m.content.map(p => this.mapContentPartToResponses(p))
+            : [{ type: 'input_text', text: String(m.content || '') }]
+        }))
+      : [];
 
-    // Build params
+    // Build params (include only supported/common controls)
     const params = {
       model: body.model,
       input,
-      // Map sampling controls if present
       temperature: body.temperature,
       top_p: body.top_p,
       stream: true,
@@ -317,14 +350,14 @@ export class MyDurableObject {
 
     let stream;
     try {
-      // Prefer the iterator-friendly API for Workers
+      // Stream and iterate events
       stream = await client.responses.stream(params);
       this.oaStream = stream;
 
       for await (const event of stream) {
         if (this.phase !== 'running') break;
 
-        // Collect text deltas; include refusal delta if present
+        // Accumulate output text/refusal deltas
         if (event.type === 'response.output_text.delta' && event.delta) {
           this.queueDelta(event.delta);
         } else if (event.type === 'response.refusal.delta' && event.delta) {
