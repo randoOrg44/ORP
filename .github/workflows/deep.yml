@@ -1,5 +1,6 @@
 on:
   workflow_dispatch:
+  push:
 jobs:
   deploy-cloudflare:
     runs-on: ubuntu-latest
