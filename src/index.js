@@ -70,6 +70,9 @@ export class MyDurableObject {
     this.error = null;
     this.controller = null;
 
+    // OpenAI stream handle (to allow abort)
+    this.oaStream = null;
+
     // Batching/throttling
     this.pending = '';        // text waiting to be flushed/broadcasted
     this.flushTimer = null;
@@ -180,12 +183,6 @@ export class MyDurableObject {
     }
   }
 
-  // Append an end reason to the last chat (always as a delta at the end)
-  appendEndReason(reason) {
-    const clean = String(reason || 'unknown').replace(/\s+/g, ' ').trim().slice(0, 128);
-    this.queueDelta(` [end:${clean}]`);
-  }
-
   async fetch(req) {
     const url = new URL(req.url);
     const upgrade = req.headers.get('Upgrade');
@@ -249,7 +246,7 @@ export class MyDurableObject {
 
     if (m.type !== 'begin') return this.send(ws, { type: 'err', message: 'bad_type' });
 
-    const { rid, apiKey, or_body, model, messages, after } = m;
+    const { rid, apiKey, or_body, model, messages, after, provider } = m;
     const body = or_body || (model && Array.isArray(messages) ? { model, messages, stream: true } : null);
 
     if (!rid || !apiKey || !body || !Array.isArray(body.messages) || body.messages.length === 0) {
@@ -272,16 +269,102 @@ export class MyDurableObject {
     this.controller = new AbortController();
     this.saveSnapshot();
 
-    this.stream({ apiKey, body }).catch(e => this.fail(String(e?.message || 'stream_failed')));
+    this.stream({ apiKey, body, provider: (provider || 'openrouter') }).catch(e => this.fail(String(e?.message || 'stream_failed')));
   }
 
-  async stream({ apiKey, body }) {
+  // provider: 'openai' | 'openrouter' (default)
+  async stream({ apiKey, body, provider }) {
+    // NOTE: no end-reason is appended to output anymore
+    if (provider === 'openai') {
+      await this.streamOpenAI({ apiKey, body });
+      return;
+    }
+
+    // Default: OpenRouter (unchanged)
+    await this.streamOpenRouter({ apiKey, body });
+  }
+
+  // New: Direct OpenAI Responses API streaming path
+  async streamOpenAI({ apiKey, body }) {
+    const client = new OpenAI({ apiKey });
+
+    // Translate chat.completions-style body to Responses API
+    const input = Array.isArray(body.messages) ? body.messages.map(m => ({
+      role: m.role,
+      // Pass through content as-is (array of {type, text, ...}) is supported in Responses
+      content: m.content
+    })) : [];
+
+    // Build params
+    const params = {
+      model: body.model,
+      input,
+      // Map sampling controls if present
+      temperature: body.temperature,
+      top_p: body.top_p,
+      top_k: body.top_k,
+      frequency_penalty: body.frequency_penalty,
+      presence_penalty: body.presence_penalty,
+      repetition_penalty: body.repetition_penalty,
+      min_p: body.min_p,
+      top_a: body.top_a,
+      stream: true,
+    };
+    if (Number.isFinite(+body.max_tokens) && +body.max_tokens > 0) {
+      // Responses API uses max_output_tokens
+      params.max_output_tokens = +body.max_tokens;
+    }
+    if (body.reasoning && body.reasoning.effort) {
+      params.reasoning = { effort: body.reasoning.effort };
+    }
+    if (body.verbosity) {
+      params.verbosity = body.verbosity;
+    }
+
+    let stream;
+    try {
+      // Prefer the iterator-friendly API for Workers
+      stream = await client.responses.stream(params);
+      this.oaStream = stream;
+
+      for await (const event of stream) {
+        if (this.phase !== 'running') break;
+
+        // Collect text deltas; include refusal delta if present
+        if (event.type === 'response.output_text.delta' && event.delta) {
+          this.queueDelta(event.delta);
+        } else if (event.type === 'response.refusal.delta' && event.delta) {
+          this.queueDelta(event.delta);
+        }
+      }
+    } catch (e) {
+      if (this.phase === 'running') {
+        const msg = String(e?.message || 'stream_failed');
+        if ((e && e.name === 'AbortError') || /abort/i.test(msg)) {
+          // Stopped elsewhere; just exit
+          return;
+        }
+        return this.fail(msg);
+      }
+      return;
+    } finally {
+      // Best-effort close
+      try { stream?.controller?.abort(); } catch {}
+      this.oaStream = null;
+    }
+
+    // Normal finish
+    if (this.phase === 'running') {
+      this.finish();
+    }
+  }
+
+  // Existing: OpenRouter (kept intact)
+  async streamOpenRouter({ apiKey, body }) {
     const client = new OpenAI({
       apiKey,
       baseURL: 'https://openrouter.ai/api/v1',
     });
-
-    let finishReason = null;
 
     try {
       const params = { ...body, stream: true };
@@ -289,20 +372,16 @@ export class MyDurableObject {
 
       for await (const chunk of stream) {
         if (this.phase !== 'running') {
-          // likely stopped elsewhere; just break
           break;
         }
         const delta = chunk?.choices?.[0]?.delta?.content ?? '';
         if (delta) this.queueDelta(delta);
-        const fr = chunk?.choices?.[0]?.finish_reason;
-        if (fr) finishReason = fr;
+        // finish_reason deliberately ignored; we no longer append it
       }
     } catch (e) {
-      // If aborted due to stop(), do nothing here; stop() handles appending reason and finishing.
       if (this.phase === 'running') {
         const msg = String(e?.message || 'stream_failed');
         if ((e && e.name === 'AbortError') || /abort/i.test(msg)) {
-          // stop() will append reason and finalize
           return;
         }
         return this.fail(msg);
@@ -310,49 +389,48 @@ export class MyDurableObject {
       return;
     }
 
-    // Normal finish via streaming end
     if (this.phase === 'running') {
-      this.finish(finishReason || 'done');
+      this.finish();
     }
   }
 
-  finish(reason = 'done') {
+  finish() {
     if (this.phase !== 'running') return;
-    this.appendEndReason(reason);
+    // Do not append any end reason; just finalize
     this.flush(true);
     this.phase = 'done';
     try { this.controller?.abort(); } catch {}
+    try { this.oaStream?.controller?.abort(); } catch {}
     this.saveSnapshot();
     this.bcast({ type: 'done' });
   }
 
   stop(origin = 'client') {
     if (this.phase !== 'running') return;
-    // Append reason and finalize
-    this.appendEndReason(`stop:${origin}`);
+    // Do not append any end reason; just finalize
     this.flush(true);
     this.phase = 'done';
     try { this.controller?.abort(); } catch {}
+    try { this.oaStream?.controller?.abort(); } catch {}
     this.saveSnapshot();
     this.bcast({ type: 'done' });
   }
 
   fail(message) {
     if (this.phase === 'error') return;
-    const reason = `error:${String(message || 'unknown')}`.replace(/\s+/g, ' ').trim().slice(0, 200);
+    const reason = String(message || 'stream_failed');
 
     if (this.phase === 'running') {
-      // Append reason to the last chat if stream was active
-      this.appendEndReason(reason);
+      // Do not append any end reason; ensure pending is flushed
       this.flush(true);
     } else {
-      // Ensure any pending is flushed so GET shows current text
       this.flush(true);
     }
 
     this.phase = 'error';
-    this.error = String(message || 'stream_failed');
+    this.error = reason;
     try { this.controller?.abort(); } catch {}
+    try { this.oaStream?.controller?.abort(); } catch {}
     this.saveSnapshot();
     this.bcast({ type: 'err', message: this.error });
   }
