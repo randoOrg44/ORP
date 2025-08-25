@@ -515,4 +515,3 @@ export class MyDurableObject {
 
   async fail(message) { this.failInternal(message, Date.now()); }
 }
-```0
