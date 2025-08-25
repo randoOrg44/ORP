@@ -1,6 +1,10 @@
 // src/index.js
 import OpenAI from 'openai';
 
+// Default routing: 'openrouter' | 'openai'
+// You can override this in your Cloudflare Worker env with DEFAULT_ROUTE.
+const DEFAULT_ROUTE = 'openai';
+
 // How long a saved run snapshot is considered fresh (for cold restore)
 const TTL_MS = 20 * 60 * 1000;
 
@@ -60,6 +64,9 @@ export class MyDurableObject {
 
     this.sockets = new Set();
     this.reset();
+
+    // Routing default: env override -> code default
+    this.defaultRoute = String(env?.DEFAULT_ROUTE || DEFAULT_ROUTE).toLowerCase() === 'openai' ? 'openai' : 'openrouter';
   }
 
   reset() {
@@ -252,6 +259,10 @@ export class MyDurableObject {
     const { rid, apiKey, or_body, model, messages, after } = m;
     const body = or_body || (model && Array.isArray(messages) ? { model, messages, stream: true } : null);
 
+    // Route/provider selection: 'openrouter' (default) or 'openai'
+    const routeRaw = (m.route || m.provider || this.defaultRoute || 'openrouter');
+    const route = String(routeRaw).toLowerCase() === 'openai' ? 'openai' : 'openrouter';
+
     if (!rid || !apiKey || !body || !Array.isArray(body.messages) || body.messages.length === 0) {
       return this.send(ws, { type: 'err', message: 'missing_fields' });
     }
@@ -272,20 +283,34 @@ export class MyDurableObject {
     this.controller = new AbortController();
     this.saveSnapshot();
 
-    this.stream({ apiKey, body }).catch(e => this.fail(String(e?.message || 'stream_failed')));
+    this.stream({ apiKey, body, route }).catch(e => this.fail(String(e?.message || 'stream_failed')));
   }
 
-  async stream({ apiKey, body }) {
+  async stream({ apiKey, body, route }) {
+    // Choose routing
+    const useOpenRouter = String(route || this.defaultRoute || 'openrouter').toLowerCase() !== 'openai';
+
     const client = new OpenAI({
       apiKey,
-      baseURL: 'https://openrouter.ai/api/v1',
+      // When using OpenRouter, set baseURL; otherwise default to OpenAI's API
+      baseURL: useOpenRouter ? 'https://openrouter.ai/api/v1' : undefined,
     });
+
+    // Optional: add extra headers for OpenRouter (uncomment if desired)
+    // const extraHeaders = useOpenRouter ? {
+    //   'HTTP-Referer': this.env?.SITE_URL || '',
+    //   'X-Title': this.env?.APP_TITLE || 'ORP',
+    // } : {};
 
     let finishReason = null;
 
     try {
       const params = { ...body, stream: true };
-      const stream = await client.chat.completions.create(params, { signal: this.controller.signal });
+      // The OpenAI SDK handles both OpenAI and OpenRouter chat completions when baseURL is set accordingly
+      const stream = await client.chat.completions.create(params, {
+        signal: this.controller.signal,
+        // headers: extraHeaders, // optional
+      });
 
       for await (const chunk of stream) {
         if (this.phase !== 'running') {
