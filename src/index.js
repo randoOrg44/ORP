@@ -1,7 +1,10 @@
+// Constants and helpers
 const TTL_MS = 20601000; // ~5.72h
 const FLUSH_MS = 50;     // broadcast cadence
 const SNAPSHOT_MS = 250; // storage write throttle
 const LOG_PREFIX = "do-stream";
+const WS_KEEPALIVE_MS = 30000;    // WebSocket keepalive cadence
+const UPSTREAM_IDLE_WARN_MS = 30000; // warn if no bytes for this long
 
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
@@ -73,6 +76,7 @@ export class MyDurableObject {
     this.state = state;
     this.env = env;
     this.sockets = new Set();
+    this.wsKaTimer = null; // keepalive interval handle
     this.reset();
   }
 
@@ -110,13 +114,31 @@ export class MyDurableObject {
       readerDone: false,
       upstream: { status: null, reqId: null, model: null },
       terminal: { reason: null, at: 0 },
+      upstreamLastByteAt: 0,
+      upstreamIdleWarns: 0,
     };
   }
 
   log(ev, extra = {}) {
-    try {
-      console.log(JSON.stringify({ p: LOG_PREFIX, ev, rid: this.rid, phase: this.phase, t: Date.now(), ...extra }));
-    } catch {}
+    try { console.log(JSON.stringify({ p: LOG_PREFIX, ev, rid: this.rid, phase: this.phase, t: Date.now(), ...extra })); } catch {}
+  }
+
+  // WebSocket keepalive management
+  startWsKeepalive() {
+    if (this.wsKaTimer || this.sockets.size === 0) return;
+    this.wsKaTimer = setInterval(() => {
+      const s = JSON.stringify({ type: "ka", ts: Date.now() });
+      let n = 0;
+      for (const ws of this.sockets) { try { ws.send(s); n++; } catch {} }
+      this.log("ws_keepalive", { fanout: n });
+    }, WS_KEEPALIVE_MS);
+  }
+  stopWsKeepaliveIfIdle() {
+    if (this.sockets.size === 0 && this.wsKaTimer) {
+      clearInterval(this.wsKaTimer);
+      this.wsKaTimer = null;
+      this.log("ws_keepalive_stop", {});
+    }
   }
 
   async restoreIfCold() {
@@ -152,7 +174,6 @@ export class MyDurableObject {
       requestMessages: this.requestMessages,
       lastUpdateAt: this.lastUpdateAt,
       savedAt: now,
-      // expose metrics to snapshot to help debugging
       metrics: this.metrics
     };
     this.savedAt = now;
@@ -176,9 +197,7 @@ export class MyDurableObject {
 
       const msg = JSON.stringify({ type: "delta", seq, text: d });
       let fanout = 0;
-      for (const ws of this.sockets) {
-        try { ws.send(msg); fanout++; } catch {}
-      }
+      for (const ws of this.sockets) { try { ws.send(msg); fanout++; } catch {} }
       this.metrics.wsBroadcasts += fanout;
       this.metrics.flushes++;
       this.metrics.lastFlushAt = Date.now();
@@ -199,10 +218,7 @@ export class MyDurableObject {
   }
 
   async flushFinal() {
-    if (this.flushTimer) {
-      clearTimeout(this.flushTimer);
-      this.flushTimer = null;
-    }
+    if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
     await this.flushNow();
     this.maybeSaveSnapshot(true);
   }
@@ -210,15 +226,11 @@ export class MyDurableObject {
   bcast(o) {
     const s = JSON.stringify(o);
     let n = 0;
-    for (const ws of this.sockets) {
-      try { ws.send(s); n++; } catch {}
-    }
+    for (const ws of this.sockets) { try { ws.send(s); n++; } catch {} }
     if (o?.type === "done" || o?.type === "err") this.log("terminal_bcast", { type: o.type, fanout: n });
   }
 
-  send(ws, o) {
-    try { ws.send(JSON.stringify(o)); } catch {}
-  }
+  send(ws, o) { try { ws.send(JSON.stringify(o)); } catch {} }
 
   replay(ws, after) {
     let n = 0;
@@ -233,6 +245,7 @@ export class MyDurableObject {
   async fetch(req) {
     const u = new URL(req.url);
 
+    // Snapshot
     if (req.method === "GET" && u.pathname === "/snapshot" && req.headers.get("Upgrade") !== "websocket") {
       await this.restoreIfCold();
       const ttlRemaining = Math.max(0, (this.savedAt || 0) + TTL_MS - Date.now());
@@ -251,9 +264,8 @@ export class MyDurableObject {
       });
     }
 
-    if (req.method !== "GET" || req.headers.get("Upgrade") !== "websocket") {
-      return text("Expected websocket", 426);
-    }
+    // WebSocket
+    if (req.method !== "GET" || req.headers.get("Upgrade") !== "websocket") return text("Expected websocket", 426);
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -261,11 +273,13 @@ export class MyDurableObject {
 
     server.accept();
     this.sockets.add(server);
+    this.startWsKeepalive();
 
     const onCloseOrError = () => {
       this.sockets.delete(server);
       server.removeEventListener("close", onCloseOrError);
       server.removeEventListener("error", onCloseOrError);
+      this.stopWsKeepaliveIfIdle();
     };
 
     server.addEventListener("close", onCloseOrError);
@@ -366,6 +380,16 @@ export class MyDurableObject {
 
     let buf = "";
     let doneSignal = false;
+    this.metrics.upstreamLastByteAt = Date.now();
+
+    // Idle watchdog: warn if no upstream bytes for > UPSTREAM_IDLE_WARN_MS
+    let idleTimer = setInterval(() => {
+      const idle = Date.now() - this.metrics.upstreamLastByteAt;
+      if (idle >= UPSTREAM_IDLE_WARN_MS && this.phase === "running") {
+        this.metrics.upstreamIdleWarns++;
+        this.log("upstream_idle_warning", { idleMs: idle, warns: this.metrics.upstreamIdleWarns });
+      }
+    }, Math.min(UPSTREAM_IDLE_WARN_MS, 5000));
 
     const push = (d) => {
       this.pendingText += d;
@@ -380,10 +404,11 @@ export class MyDurableObject {
         if (r.err) this.log("reader_read_error", { err: String(r.err) });
         if (r.done) { this.metrics.readerDone = true; break; }
 
+        this.metrics.upstreamLastByteAt = Date.now();
         this.metrics.bytesIn += r.value?.byteLength ?? 0;
         buf += dec.decode(r.value, { stream: true });
 
-        // Process complete lines (SSE)
+        // Parse SSE lines
         while (true) {
           const idx = buf.indexOf("\n");
           if (idx === -1) break;
@@ -428,6 +453,7 @@ export class MyDurableObject {
       }
     } finally {
       try { await reader.cancel(); } catch {}
+      try { clearInterval(idleTimer); } catch {}
     }
 
     await this.flushFinal();
@@ -455,7 +481,7 @@ export class MyDurableObject {
     this.bcast({ type: "done" });
   }
 
-  async finish() { /* not used directly; keep for compatibility */ }
+  async finish() { /* reserved */ }
 
   stop() {
     if (this.phase !== "running") return;
@@ -489,3 +515,4 @@ export class MyDurableObject {
 
   async fail(message) { this.failInternal(message, Date.now()); }
 }
+```0
