@@ -18,7 +18,6 @@ const withCORS = (resp) => {
   return new Response(resp.body, { ...resp, headers });
 };
 
-// The Worker entrypoint remains the same.
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
@@ -52,8 +51,7 @@ export class MyDurableObject {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    // CHANGED: We no longer manage sockets manually. The native API handles this.
-    // this.sockets = new Set();
+    this.sockets = new Set();
     this.reset();
   }
 
@@ -88,30 +86,35 @@ export class MyDurableObject {
 
   bcast(obj) {
     const message = JSON.stringify(obj);
-    // CHANGED: Use the native API to get all connected WebSocket clients.
-    for (const ws of this.state.getWebSockets()) {
-      try {
-        ws.send(message);
-      } catch (e) {
-        // This can happen if a socket is in the process of closing.
-        // We can ignore it.
-      }
-    }
+    this.sockets.forEach(ws => { try { ws.send(message); } catch {} });
   }
 
   async restoreIfCold() {
-    if (this.rid) return;
+    if (this.rid) return; // Already restored, object is "warm".
+    
     const snap = await this.state.storage.get('run').catch(() => null);
     if (!snap || (Date.now() - (snap.savedAt || 0) >= TTL_MS)) {
       if (snap) await this.state.storage.delete('run').catch(() => {});
       return;
     }
+
+    // Restore properties from the snapshot
     this.rid = snap.rid || null;
     this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
     this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
     this.phase = snap.phase || 'done';
     this.error = snap.error || null;
     this.pending = '';
+
+    // As per Master's instruction: if the DO boots up and its last phase was 'running',
+    // it means the process was interrupted, likely by runtime eviction.
+    // We change the phase to 'evicted' to mark it as a terminated, non-successful run.
+    if (this.phase === 'running') {
+      this.phase = 'evicted';
+      this.error = 'The run was interrupted due to system eviction.';
+      // Persist this updated terminal state immediately.
+      this.saveSnapshot();
+    }
   }
 
   saveSnapshot() {
@@ -137,8 +140,13 @@ export class MyDurableObject {
     this.buffer.forEach(it => {
       if (it.seq > after) this.send(ws, { type: 'delta', seq: it.seq, text: it.text });
     });
-    if (this.phase === 'done') this.send(ws, { type: 'done' });
-    if (this.phase === 'error') this.send(ws, { type: 'err', message: this.error });
+    
+    // Notify client of terminal state
+    if (this.phase === 'done') {
+      this.send(ws, { type: 'done' });
+    } else if (this.phase === 'error' || this.phase === 'evicted') {
+      this.send(ws, { type: 'err', message: this.error || 'The run was terminated unexpectedly.' });
+    }
   }
 
   flush(force = false) {
@@ -169,40 +177,38 @@ export class MyDurableObject {
     if (req.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
-    
-    // CHANGED: Use the native hibernating WebSocket API
     if (req.headers.get('Upgrade') === 'websocket') {
       const [client, server] = Object.values(new WebSocketPair());
-
-      // This is the critical change. `acceptWebSocket` enables hibernation
-      // and ties the DO's lifecycle correctly to its activity.
-      this.state.acceptWebSocket(server);
-
+      server.accept();
+      this.sockets.add(server);
+      server.addEventListener('close', () => this.sockets.delete(server));
+      server.addEventListener('message', e => this.state.waitUntil(this.onMessage(server, e)));
       return new Response(null, { status: 101, webSocket: client });
     }
-
     if (req.method === 'GET') {
       await this.restoreIfCold();
       const text = this.buffer.map(it => it.text).join('') + this.pending;
+
+      const isTerminal = ['done', 'error', 'evicted'].includes(this.phase);
+      const isError = ['error', 'evicted'].includes(this.phase);
+
       return this.corsJSON({
         rid: this.rid,
         seq: this.seq,
         phase: this.phase,
-        done: this.phase === 'done',
-        error: this.phase === 'error' ? this.error : null,
+        done: isTerminal,
+        error: isError ? (this.error || 'The run was terminated unexpectedly.') : null,
         text,
       });
     }
-
     return this.corsJSON({ error: 'not allowed' }, 405);
   }
 
-  // NEW: This is the native WebSocket message handler. It replaces `onMessage`.
-  async webSocketMessage(ws, messageData) {
+  async onMessage(ws, evt) {
     await this.restoreIfCold();
     let msg;
     try {
-      msg = JSON.parse(String(messageData || ''));
+      msg = JSON.parse(String(evt.data || ''));
     } catch {
       return this.send(ws, { type: 'err', message: 'bad_json' });
     }
@@ -238,20 +244,7 @@ export class MyDurableObject {
     this.controller = new AbortController();
     this.saveSnapshot();
 
-    // The stream process is wrapped in waitUntil, which is now sufficient
-    // to keep the DO alive because the WebSocket itself is managed by the runtime.
     this.state.waitUntil(this.stream({ apiKey, body, provider: provider || 'openrouter' }));
-  }
-
-  // NEW: Native handler for closed connections.
-  async webSocketClose(ws, code, reason, wasClean) {
-    // The runtime handles removing the socket. No manual cleanup is needed.
-    // You could add logging here if desired.
-  }
-
-  // NEW: Native handler for WebSocket errors.
-  async webSocketError(ws, error) {
-    console.error("WebSocket error:", error);
   }
 
   async stream({ apiKey, body, provider }) {
