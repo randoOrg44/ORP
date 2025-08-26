@@ -5,6 +5,11 @@ const BATCH_MS = 60;
 const BATCH_BYTES = 2048;
 const SNAPSHOT_MIN_MS = 1500;
 
+// Heartbeat configuration: emulate two alarms per 4s by a 2s cadence
+const HB_TOTAL_MS = 4000;
+const HB_OFFSET_MS = 2000;
+const HB_TICK_MS = HB_OFFSET_MS; // single DO alarm -> tick every 2s
+
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, OPTIONS',
@@ -67,6 +72,10 @@ export class MyDurableObject {
     this.flushTimer = null;
     this.lastSavedAt = 0;
     this.lastFlushedAt = 0;
+
+    // Heartbeat state
+    this.hbActive = false;
+    this.hbSlot = 0; // virtual 2-slot heartbeat (0/1) to represent 2 alarms per 4s
   }
 
   corsJSON(obj, status = 200) {
@@ -114,6 +123,8 @@ export class MyDurableObject {
       this.error = 'The run was interrupted due to system eviction.';
       // Persist this updated terminal state immediately.
       this.saveSnapshot();
+      // Ensure heartbeat is off for terminal state
+      this.stopHeartbeat().catch(() => {});
     }
   }
 
@@ -244,6 +255,9 @@ export class MyDurableObject {
     this.controller = new AbortController();
     this.saveSnapshot();
 
+    // Start heartbeat while running
+    this.state.waitUntil(this.startHeartbeat());
+
     this.state.waitUntil(this.stream({ apiKey, body, provider: provider || 'openrouter' }));
   }
 
@@ -364,6 +378,8 @@ export class MyDurableObject {
     try { this.oaStream?.controller?.abort(); } catch {}
     this.saveSnapshot();
     this.bcast({ type: 'done' });
+    // Stop heartbeat on terminal state
+    this.state.waitUntil(this.stopHeartbeat());
   }
 
   fail(message) {
@@ -375,5 +391,46 @@ export class MyDurableObject {
     try { this.oaStream?.controller?.abort(); } catch {}
     this.saveSnapshot();
     this.bcast({ type: 'err', message: this.error });
+    // Stop heartbeat on terminal state
+    this.state.waitUntil(this.stopHeartbeat());
+  }
+
+  // Heartbeat: emulate two alarms per 4s via single DO alarm every 2s
+  async startHeartbeat() {
+    if (this.hbActive || this.phase !== 'running') return;
+    this.hbActive = true;
+    this.hbSlot = 0;
+    try {
+      await this.state.storage.setAlarm(Date.now() + HB_OFFSET_MS);
+    } catch {}
+  }
+
+  async stopHeartbeat() {
+    this.hbActive = false;
+    this.hbSlot = 0;
+    try {
+      await this.state.storage.setAlarm(null); // clear any pending alarm
+    } catch {}
+  }
+
+  // Alarm handler
+  async alarm() {
+    await this.restoreIfCold();
+    if (this.phase !== 'running' || !this.hbActive) {
+      // not running or heartbeat disabled -> clear any alarm
+      try { await this.state.storage.setAlarm(null); } catch {}
+      return;
+    }
+
+    // Heartbeat tick: persist occasionally to keep the DO active
+    this.saveSnapshotThrottled();
+
+    // Flip virtual slot (0/1) to represent two alarms per 4s offset by 2s
+    this.hbSlot = (this.hbSlot ^ 1);
+
+    // Re-arm next tick after 2s to keep the 2s cadence (two per 4s)
+    try {
+      await this.state.storage.setAlarm(Date.now() + HB_TICK_MS);
+    } catch {}
   }
 }
