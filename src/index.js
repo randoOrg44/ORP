@@ -70,8 +70,6 @@ export class MyDurableObject {
     this.flushTimer = null;
     this.lastSavedAt = 0;
     this.lastFlushedAt = 0;
-
-    // Heartbeat state
     this.hbActive = false;
   }
 
@@ -96,7 +94,7 @@ export class MyDurableObject {
   }
 
   async restoreIfCold() {
-    if (this.rid) return; // Already restored, object is "warm".
+    if (this.rid) return;
     
     const snap = await this.state.storage.get('run').catch(() => null);
     if (!snap || (Date.now() - (snap.savedAt || 0) >= TTL_MS)) {
@@ -104,7 +102,6 @@ export class MyDurableObject {
       return;
     }
 
-    // Restore properties from the snapshot
     this.rid = snap.rid || null;
     this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
     this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
@@ -112,15 +109,10 @@ export class MyDurableObject {
     this.error = snap.error || null;
     this.pending = '';
 
-    // As per Master's instruction: if the DO boots up and its last phase was 'running',
-    // it means the process was interrupted, likely by runtime eviction.
-    // We change the phase to 'evicted' to mark it as a terminated, non-successful run.
     if (this.phase === 'running') {
       this.phase = 'evicted';
       this.error = 'The run was interrupted due to system eviction.';
-      // Persist this updated terminal state immediately.
       this.saveSnapshot();
-      // Ensure heartbeat is off for terminal state
       this.stopHeartbeat().catch(() => {});
     }
   }
@@ -149,7 +141,6 @@ export class MyDurableObject {
       if (it.seq > after) this.send(ws, { type: 'delta', seq: it.seq, text: it.text });
     });
     
-    // Notify client of terminal state
     if (this.phase === 'done') {
       this.send(ws, { type: 'done' });
     } else if (this.phase === 'error' || this.phase === 'evicted') {
@@ -196,7 +187,6 @@ export class MyDurableObject {
     if (req.method === 'GET') {
       await this.restoreIfCold();
       const text = this.buffer.map(it => it.text).join('') + this.pending;
-
       const isTerminal = ['done', 'error', 'evicted'].includes(this.phase);
       const isError = ['error', 'evicted'].includes(this.phase);
 
@@ -221,11 +211,6 @@ export class MyDurableObject {
       return this.send(ws, { type: 'err', message: 'bad_json' });
     }
 
-    if (msg.type === 'resume') {
-      if (!msg.rid || msg.rid !== this.rid) return this.send(ws, { type: 'err', message: 'stale_run' });
-      return this.replay(ws, Number.isFinite(+msg.after) ? +msg.after : -1);
-    }
-
     if (msg.type === 'stop') {
       if (msg.rid && msg.rid === this.rid) this.stop();
       return;
@@ -242,6 +227,7 @@ export class MyDurableObject {
     if (this.phase === 'running' && rid !== this.rid) {
       return this.send(ws, { type: 'err', message: 'busy' });
     }
+    // This block now handles both new runs and reconnections ("resume")
     if (rid === this.rid && this.phase !== 'idle') {
       return this.replay(ws, Number.isFinite(+after) ? +after : -1);
     }
@@ -252,9 +238,7 @@ export class MyDurableObject {
     this.controller = new AbortController();
     this.saveSnapshot();
 
-    // Start heartbeat while running
     this.state.waitUntil(this.startHeartbeat());
-
     this.state.waitUntil(this.stream({ apiKey, body, provider: provider || 'openrouter' }));
   }
 
@@ -375,7 +359,6 @@ export class MyDurableObject {
     try { this.oaStream?.controller?.abort(); } catch {}
     this.saveSnapshot();
     this.bcast({ type: 'done' });
-    // Stop heartbeat on terminal state
     this.state.waitUntil(this.stopHeartbeat());
   }
 
@@ -388,11 +371,9 @@ export class MyDurableObject {
     try { this.oaStream?.controller?.abort(); } catch {}
     this.saveSnapshot();
     this.bcast({ type: 'err', message: this.error });
-    // Stop heartbeat on terminal state
     this.state.waitUntil(this.stopHeartbeat());
   }
 
-  // Simplified Heartbeat
   async startHeartbeat() {
     if (this.hbActive || this.phase !== 'running') return;
     this.hbActive = true;
@@ -404,26 +385,23 @@ export class MyDurableObject {
   async stopHeartbeat() {
     this.hbActive = false;
     try {
-      await this.state.storage.setAlarm(null); // clear any pending alarm
+      await this.state.storage.setAlarm(null);
     } catch {}
   }
 
-  // Alarm handler
+  async Heart() {
+    if (this.phase === 'running' && this.hbActive) {
+      this.saveSnapshotThrottled();
+      try {
+        await this.state.storage.setAlarm(Date.now() + HB_INTERVAL_MS);
+      } catch {}
+    } else {
+      await this.stopHeartbeat();
+    }
+  }
+
   async alarm() {
     await this.restoreIfCold();
-
-    // If the run is no longer active, ensure we don't set another alarm.
-    if (this.phase !== 'running' || !this.hbActive) {
-      try { await this.state.storage.setAlarm(null); } catch {}
-      return;
-    }
-
-    // Heartbeat tick: persist occasionally to keep the DO active.
-    this.saveSnapshotThrottled();
-
-    // Re-arm the next alarm to continue the heartbeat.
-    try {
-      await this.state.storage.setAlarm(Date.now() + HB_INTERVAL_MS);
-    } catch {}
+    await this.Heart();
   }
 }
