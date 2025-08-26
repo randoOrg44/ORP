@@ -4,8 +4,6 @@ const TTL_MS = 20 * 60 * 1000;
 const BATCH_MS = 60;
 const BATCH_BYTES = 2048;
 const SNAPSHOT_MIN_MS = 1500;
-// NEW: heartbeat interval
-const HEARTBEAT_MS = 1000; // 4s
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -69,39 +67,6 @@ export class MyDurableObject {
     this.flushTimer = null;
     this.lastSavedAt = 0;
     this.lastFlushedAt = 0;
-    // NEW: heartbeat state
-    this.heartbeatTimer = null;
-    this.heartbeatActive = false;
-  }
-
-  // NEW: heartbeat loop using storage.get to keep DO hot
-  startHeartbeat() {
-    if (this.heartbeatActive) return;
-    this.heartbeatActive = true;
-
-    const beat = async () => {
-      if (!this.heartbeatActive) return;
-      try {
-        // No-op read; counts as activity to keep instance alive.
-        await this.state.storage.get('hb');
-      } catch {}
-      // Reschedule next beat
-      if (this.heartbeatActive) {
-        this.heartbeatTimer = setTimeout(beat, HEARTBEAT_MS);
-      }
-    };
-
-    // Kick off first beat promptly
-    this.heartbeatTimer = setTimeout(beat, HEARTBEAT_MS);
-  }
-
-  // NEW: stop heartbeat
-  stopHeartbeat() {
-    this.heartbeatActive = false;
-    if (this.heartbeatTimer) {
-      try { clearTimeout(this.heartbeatTimer); } catch {}
-      this.heartbeatTimer = null;
-    }
   }
 
   corsJSON(obj, status = 200) {
@@ -125,31 +90,19 @@ export class MyDurableObject {
   }
 
   async restoreIfCold() {
-  if (this.rid) return;
-  const snap = await this.state.storage.get('run').catch(() => null);
-  if (!snap || (Date.now() - (snap.savedAt || 0) >= TTL_MS)) {
-    if (snap) await this.state.storage.delete('run').catch(() => {});
-    return;
-  }
-  this.rid = snap.rid || null;
-  this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
-  this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
-
-  // If the DO was evicted mid-stream, reflect that state on restore.
-  if (snap.phase === 'running') {
-    this.phase = 'evicted';
-    // Optionally retain any previous error; otherwise keep null.
-    this.error = snap.error || null;
-    // Persist the transition so we don't keep flipping on subsequent restores.
-    this.saveSnapshot();
-  } else {
+    if (this.rid) return;
+    const snap = await this.state.storage.get('run').catch(() => null);
+    if (!snap || (Date.now() - (snap.savedAt || 0) >= TTL_MS)) {
+      if (snap) await this.state.storage.delete('run').catch(() => {});
+      return;
+    }
+    this.rid = snap.rid || null;
+    this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
+    this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
     this.phase = snap.phase || 'done';
     this.error = snap.error || null;
+    this.pending = '';
   }
-
-  this.pending = '';
-}
-
 
   saveSnapshot() {
     this.lastSavedAt = Date.now();
@@ -269,9 +222,6 @@ export class MyDurableObject {
     this.controller = new AbortController();
     this.saveSnapshot();
 
-    // NEW: start heartbeat for the streaming lifecycle
-    this.startHeartbeat();
-
     this.state.waitUntil(this.stream({ apiKey, body, provider: provider || 'openrouter' }));
   }
 
@@ -290,9 +240,6 @@ export class MyDurableObject {
           this.fail(msg);
         }
       }
-    } finally {
-      // NEW: ensure heartbeat stops regardless of outcome
-      this.stopHeartbeat();
     }
   }
 
@@ -395,8 +342,6 @@ export class MyDurableObject {
     try { this.oaStream?.controller?.abort(); } catch {}
     this.saveSnapshot();
     this.bcast({ type: 'done' });
-    // NEW: stop heartbeat on normal stop
-    this.stopHeartbeat();
   }
 
   fail(message) {
@@ -408,7 +353,5 @@ export class MyDurableObject {
     try { this.oaStream?.controller?.abort(); } catch {}
     this.saveSnapshot();
     this.bcast({ type: 'err', message: this.error });
-    // NEW: stop heartbeat on failure
-    this.stopHeartbeat();
   }
 }
