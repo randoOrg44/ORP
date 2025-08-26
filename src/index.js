@@ -3,7 +3,7 @@ import OpenAI from 'openai';
 const TTL_MS = 20 * 60 * 1000;
 const BATCH_MS = 60;
 const BATCH_BYTES = 2048;
-const SNAPSHOT_MIN_MS = 1500;
+// SNAPSHOT_MIN_MS is no longer needed as we removed throttled saving.
 
 // Heartbeat configuration: run every 4s while streaming to prevent eviction.
 const HB_INTERVAL_MS = 4000;
@@ -76,11 +76,7 @@ export class MyDurableObject {
   corsJSON(obj, status = 200) {
     return new Response(JSON.stringify(obj), {
       status,
-      headers: {
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-store',
-        ...CORS_HEADERS,
-      }
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS_HEADERS }
     });
   }
 
@@ -112,7 +108,7 @@ export class MyDurableObject {
     if (this.phase === 'running') {
       this.phase = 'evicted';
       this.error = 'The run was interrupted due to system eviction.';
-      this.saveSnapshot();
+      this.saveSnapshot(); // Persist the final 'evicted' state.
       this.stopHeartbeat().catch(() => {});
     }
   }
@@ -128,12 +124,6 @@ export class MyDurableObject {
       savedAt: this.lastSavedAt,
     };
     this.state.storage.put('run', data).catch(() => {});
-  }
-
-  saveSnapshotThrottled() {
-    if (Date.now() - this.lastSavedAt >= SNAPSHOT_MIN_MS) {
-      this.saveSnapshot();
-    }
   }
 
   replay(ws, after) {
@@ -159,7 +149,8 @@ export class MyDurableObject {
       this.pending = '';
       this.lastFlushedAt = Date.now();
     }
-    force ? this.saveSnapshot() : this.saveSnapshotThrottled();
+    // Only save the snapshot if explicitly forced (i.e., at the end of a run).
+    if (force) this.saveSnapshot();
   }
 
   queueDelta(text) {
@@ -227,7 +218,6 @@ export class MyDurableObject {
     if (this.phase === 'running' && rid !== this.rid) {
       return this.send(ws, { type: 'err', message: 'busy' });
     }
-    // This block now handles both new runs and reconnections ("resume")
     if (rid === this.rid && this.phase !== 'idle') {
       return this.replay(ws, Number.isFinite(+after) ? +after : -1);
     }
@@ -236,7 +226,7 @@ export class MyDurableObject {
     this.rid = rid;
     this.phase = 'running';
     this.controller = new AbortController();
-    this.saveSnapshot();
+    this.saveSnapshot(); // Save the initial state of the run.
 
     this.state.waitUntil(this.startHeartbeat());
     this.state.waitUntil(this.stream({ apiKey, body, provider: provider || 'openrouter' }));
@@ -262,10 +252,7 @@ export class MyDurableObject {
 
   isMultimodalMessage(m) {
     if (!m || !Array.isArray(m.content)) return false;
-    return m.content.some(p => {
-      const type = p?.type || '';
-      return type && type !== 'text' && type !== 'input_text';
-    });
+    return m.content.some(p => p?.type && p.type !== 'text' && p.type !== 'input_text');
   }
 
   extractTextFromMessage(m) {
@@ -274,7 +261,7 @@ export class MyDurableObject {
     if (!Array.isArray(m.content)) return '';
     return m.content
       .filter(p => p && (p.type === 'text' || p.type === 'input_text'))
-      .map(p => String((p.type === 'text') ? (p.text ?? p.content ?? '') : (p.text ?? '')))
+      .map(p => String(p.type === 'text' ? (p.text ?? p.content ?? '') : (p.text ?? '')))
       .join('');
   }
 
@@ -285,7 +272,7 @@ export class MyDurableObject {
       return url ? { type: 'input_image', image_url: String(url) } : null;
     }
     if (type === 'text' || type === 'input_text') {
-      const text = (type === 'text') ? (part.text ?? part.content ?? '') : (part.text ?? '');
+      const text = type === 'text' ? (part.text ?? part.content ?? '') : (part.text ?? '');
       return { type: 'input_text', text: String(text) };
     }
     return { type: 'input_text', text: `[${type}:${part?.file?.filename || 'file'}]` };
@@ -326,10 +313,7 @@ export class MyDurableObject {
     try {
       for await (const event of this.oaStream) {
         if (this.phase !== 'running') break;
-        const delta = event.delta;
-        if ((event.type.endsWith('.delta')) && delta) {
-          this.queueDelta(delta);
-        }
+        if (event.type.endsWith('.delta') && event.delta) this.queueDelta(event.delta);
       }
     } finally {
       try { this.oaStream?.controller?.abort(); } catch {}
@@ -352,24 +336,24 @@ export class MyDurableObject {
 
   stop() {
     if (this.phase !== 'running') return;
-    this.flush(true);
+    this.flush(true); // Flush and force a final save.
     this.phase = 'done';
     this.error = null;
     try { this.controller?.abort(); } catch {}
     try { this.oaStream?.controller?.abort(); } catch {}
-    this.saveSnapshot();
+    this.saveSnapshot(); // Explicitly save final 'done' state.
     this.bcast({ type: 'done' });
     this.state.waitUntil(this.stopHeartbeat());
   }
 
   fail(message) {
     if (this.phase === 'error') return;
-    this.flush(true);
+    this.flush(true); // Flush and force a final save.
     this.phase = 'error';
     this.error = String(message || 'stream_failed');
     try { this.controller?.abort(); } catch {}
     try { this.oaStream?.controller?.abort(); } catch {}
-    this.saveSnapshot();
+    this.saveSnapshot(); // Explicitly save final 'error' state.
     this.bcast({ type: 'err', message: this.error });
     this.state.waitUntil(this.stopHeartbeat());
   }
@@ -391,7 +375,7 @@ export class MyDurableObject {
 
   async Heart() {
     if (this.phase === 'running' && this.hbActive) {
-      this.saveSnapshotThrottled();
+      // The alarm fired, keeping us alive. Simply set the next one.
       try {
         await this.state.storage.setAlarm(Date.now() + HB_INTERVAL_MS);
       } catch {}
