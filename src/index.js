@@ -125,19 +125,31 @@ export class MyDurableObject {
   }
 
   async restoreIfCold() {
-    if (this.rid) return;
-    const snap = await this.state.storage.get('run').catch(() => null);
-    if (!snap || (Date.now() - (snap.savedAt || 0) >= TTL_MS)) {
-      if (snap) await this.state.storage.delete('run').catch(() => {});
-      return;
-    }
-    this.rid = snap.rid || null;
-    this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
-    this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
+  if (this.rid) return;
+  const snap = await this.state.storage.get('run').catch(() => null);
+  if (!snap || (Date.now() - (snap.savedAt || 0) >= TTL_MS)) {
+    if (snap) await this.state.storage.delete('run').catch(() => {});
+    return;
+  }
+  this.rid = snap.rid || null;
+  this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
+  this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
+
+  // If the DO was evicted mid-stream, reflect that state on restore.
+  if (snap.phase === 'running') {
+    this.phase = 'evicted';
+    // Optionally retain any previous error; otherwise keep null.
+    this.error = snap.error || null;
+    // Persist the transition so we don't keep flipping on subsequent restores.
+    this.saveSnapshot();
+  } else {
     this.phase = snap.phase || 'done';
     this.error = snap.error || null;
-    this.pending = '';
   }
+
+  this.pending = '';
+}
+
 
   saveSnapshot() {
     this.lastSavedAt = Date.now();
