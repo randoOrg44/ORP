@@ -7,6 +7,7 @@ const BATCH_BYTES = 2048;
 
 // Heartbeat configuration: run every 4s while streaming to prevent eviction.
 const HB_INTERVAL_MS = 4000;
+const MAX_RUN_MS = 15 * 60 * 1000;
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -71,6 +72,7 @@ export class MyDurableObject {
     this.lastSavedAt = 0;
     this.lastFlushedAt = 0;
     this.hbActive = false;
+    this.age = 0;
   }
 
   corsJSON(obj, status = 200) {
@@ -101,6 +103,7 @@ export class MyDurableObject {
     this.rid = snap.rid || null;
     this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
     this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
+    this.age = snap.age || 0;
     this.phase = snap.phase || 'done';
     this.error = snap.error || null;
     this.pending = '';
@@ -119,6 +122,7 @@ export class MyDurableObject {
       rid: this.rid,
       buffer: this.buffer,
       seq: this.seq,
+      age: this.age,
       phase: this.phase,
       error: this.error,
       savedAt: this.lastSavedAt,
@@ -374,14 +378,9 @@ export class MyDurableObject {
   }
 
   async Heart() {
-    if (this.phase === 'running' && this.hbActive) {
-      // The alarm fired, keeping us alive. Simply set the next one.
-      try {
-        await this.state.storage.setAlarm(Date.now() + HB_INTERVAL_MS);
-      } catch {}
-    } else {
-      await this.stopHeartbeat();
-    }
+    if (this.phase !== 'running' || !this.hbActive) return await this.stopHeartbeat();
+    if (++this.age * HB_INTERVAL_MS >= MAX_RUN_MS) return this.fail('Run timed out after 15 minutes.');
+    try { await this.state.storage.setAlarm(Date.now() + HB_INTERVAL_MS); } catch {}
   }
 
   async alarm() {
