@@ -103,10 +103,10 @@ export class MyDurableObject {
     this.rid = snap.rid || null;
     this.buffer = Array.isArray(snap.buffer) ? snap.buffer : [];
     this.seq = Number.isFinite(+snap.seq) ? +snap.seq : -1;
+    this.age = snap.age || 0;
     this.phase = snap.phase || 'done';
     this.error = snap.error || null;
     this.pending = '';
-    this.age = 0; // Age is reset upon restoration.
 
     if (this.phase === 'running') {
       this.phase = 'evicted';
@@ -118,14 +118,16 @@ export class MyDurableObject {
 
   saveSnapshot() {
     this.lastSavedAt = Date.now();
-    this.state.storage.put('run', {
+    const data = {
       rid: this.rid,
       buffer: this.buffer,
       seq: this.seq,
+      age: this.age,
       phase: this.phase,
       error: this.error,
       savedAt: this.lastSavedAt,
-    }).catch(() => {});
+    };
+    this.state.storage.put('run', data).catch(() => {});
   }
 
   replay(ws, after) {
